@@ -24,7 +24,6 @@ COL_MUTE :: rl.Color{220, 70, 60, 255}
 COL_GREEN :: rl.Color{70, 200, 100, 255}
 COL_YELLOW :: rl.Color{230, 200, 60, 255}
 COL_RED :: rl.Color{235, 70, 60, 255}
-COL_EQ :: rl.Color{46, 140, 80, 255}
 COL_DYN :: rl.Color{180, 120, 30, 255}
 COL_PHANTOM :: rl.Color{200, 60, 60, 255}
 COL_BUTTON :: rl.Color{56, 61, 72, 255}
@@ -34,7 +33,7 @@ STRIP_W :: 72
 HEADER_W :: 112
 TOPBAR_H :: 46
 SCROLLBAR_H :: 12
-EDITOR_W :: 410
+COL_ON :: rl.Color{226, 184, 48, 255} // "processing on" (EQ, dynamics, …), as in TotalMix
 CTL_H :: 18 // strip control height
 CTL_GAP :: 3
 
@@ -100,9 +99,15 @@ Confirm_Action :: enum {
 	Interface_Mode,
 }
 
+Reveal :: struct {
+	row:     Row,
+	ch:      int,
+	kind:    Panel_Kind,
+	pending: bool,
+}
+
 UI :: struct {
 	app:          ^App,
-	port:         string,
 	font:         rl.Font,
 	font_owned:   bool, // font is loaded by us (not raylib's default)
 	font_path:    string, // owned; "" = raylib default font
@@ -117,12 +122,16 @@ UI :: struct {
 	drag_value:   f32,
 	last_click:   u64,
 	last_click_t: f64,
+	drag_value2:  f32, // second value for 2-D drags (graph nodes)
 	scroll:       [Row]f32,
 	submix:       int,
-	// channel editor dock (edit_ch < 0: closed)
-	edit_row:     Row,
-	edit_ch:      int,
-	edit_scroll:  f32,
+	// channel panels beside their strips (key: strip_key)
+	panels:       map[u32]Panel_Set,
+	panel_scroll: map[u64]f32,
+	reveal:       Reveal, // panel to scroll into view
+	// FX dock (control room, reverb, echo)
+	fx_dock:      bool,
+	fx_scroll:    f32,
 	// settings
 	show_settings: bool,
 	jack_cfg:      Jack_Settings, // pending edit
@@ -175,6 +184,14 @@ text_centered :: proc(ui: ^UI, s: string, r: rl.Rectangle, size: f32 = FONT, col
 	text(ui, s, r.x + (r.width - w) / 2, r.y + (r.height - size) / 2, size, color)
 }
 
+// Left-aligned, truncated to max_w.
+text_fit :: proc(ui: ^UI, s: string, x, y, max_w: f32, size: f32 = FONT, color := COL_TEXT) {
+	if max_w <= 8 do return
+	s := s
+	for len(s) > 1 && text_width(ui, s, size) > max_w do s = s[:len(s) - 1]
+	text(ui, s, x, y, size, color)
+}
+
 hovered :: proc(r: rl.Rectangle) -> bool {return rl.CheckCollisionPointRec(rl.GetMousePosition(), r)}
 
 // True on the second press within 350 ms on the same widget.
@@ -204,24 +221,75 @@ interactive :: proc(ui: ^UI, r: rl.Rectangle) -> bool {
 	return !ui.clipped || hovered(ui.clip)
 }
 
-// Clips drawing and interaction to r (logical units).
-clip_begin :: proc(ui: ^UI, r: rl.Rectangle) {
-	s := ui.scale
-	rl.BeginScissorMode(i32(r.x * s), i32(r.y * s), i32(math.ceil(r.width * s)), i32(math.ceil(r.height * s)))
-	ui.clip, ui.clipped = r, true
+Clip :: struct {
+	r:  rl.Rectangle,
+	on: bool,
 }
 
-clip_end :: proc(ui: ^UI) {
-	rl.EndScissorMode()
-	ui.clipped = false
+@(private = "file")
+scissor :: proc(ui: ^UI, r: rl.Rectangle) {
+	s := ui.scale
+	rl.BeginScissorMode(i32(r.x * s), i32(r.y * s), i32(math.ceil(r.width * s)), i32(math.ceil(r.height * s)))
+}
+
+// Clips drawing and interaction to r (logical units), within any enclosing
+// clip. Restore with clip_pop(ui, returned value).
+clip_push :: proc(ui: ^UI, r: rl.Rectangle) -> (prev: Clip) {
+	prev = {ui.clip, ui.clipped}
+	r := r
+	if ui.clipped {
+		x0, y0 := max(r.x, ui.clip.x), max(r.y, ui.clip.y)
+		x1 := min(r.x + r.width, ui.clip.x + ui.clip.width)
+		y1 := min(r.y + r.height, ui.clip.y + ui.clip.height)
+		r = {x0, y0, max(0, x1 - x0), max(0, y1 - y0)}
+	}
+	scissor(ui, r)
+	ui.clip, ui.clipped = r, true
+	return
+}
+
+clip_pop :: proc(ui: ^UI, prev: Clip) {
+	if prev.on {
+		scissor(ui, prev.r)
+	} else {
+		rl.EndScissorMode()
+	}
+	ui.clip, ui.clipped = prev.r, prev.on
+}
+
+// Dark text on light button colours (yellow "on" state), white otherwise.
+on_text_color :: proc(c: rl.Color) -> rl.Color {
+	lum := 0.299 * f32(c.r) + 0.587 * f32(c.g) + 0.114 * f32(c.b)
+	return lum > 150 ? COL_TRACK : rl.WHITE
 }
 
 button :: proc(ui: ^UI, r: rl.Rectangle, label: string, on := false, on_color := COL_ACCENT, size: f32 = FONT) -> bool {
 	hot := interactive(ui, r)
 	col := on ? on_color : (hot ? COL_BUTTON_HOT : COL_BUTTON)
 	rl.DrawRectangleRounded(r, 0.25, 4, col)
-	text_centered(ui, label, r, size, on ? rl.WHITE : COL_TEXT)
+	text_centered(ui, label, r, size, on ? on_text_color(on_color) : COL_TEXT)
 	return hot && rl.IsMouseButtonPressed(.LEFT)
+}
+
+// Button with a gear icon (channel settings).
+cog_button :: proc(ui: ^UI, r: rl.Rectangle, on: bool) -> bool {
+	hot := interactive(ui, r)
+	bg := on ? COL_ACCENT : (hot ? COL_BUTTON_HOT : COL_BUTTON)
+	rl.DrawRectangleRounded(r, 0.25, 4, bg)
+	fg := on ? rl.WHITE : COL_TEXT
+	c := rl.Vector2{r.x + r.width / 2, r.y + r.height / 2}
+	R := min(r.width, r.height) * 0.36
+	for i in 0 ..< 4 {
+		rl.DrawRectanglePro({c.x, c.y, R * 0.5, 2 * R}, {R * 0.25, R}, f32(i) * 45, fg)
+	}
+	rl.DrawCircleV(c, R * 0.74, fg)
+	rl.DrawCircleV(c, R * 0.32, bg)
+	return hot && rl.IsMouseButtonPressed(.LEFT)
+}
+
+// Outline marking a strip button whose panel is open.
+open_marker :: proc(r: rl.Rectangle) {
+	rl.DrawRectangleRoundedLinesEx({r.x - 1, r.y - 1, r.width + 2, r.height + 2}, 0.3, 4, 1.5, COL_ACCENT)
 }
 
 // Shows options[cur]; left click = next option, right click = previous.
@@ -409,12 +477,28 @@ draw_row :: proc(ui: ^UI, row: Row, area: rl.Rectangle) {
 		text(ui, "click a channel\nto select its\nsubmix", head.x + 10, head.y + 54, FONT_SMALL, COL_DIM)
 	}
 	if row != .Playback {
-		text(ui, "EQ / DY or\ndouble-click a\nname: settings", head.x + 10, head.y + 118, FONT_TINY, COL_DIM)
+		text(ui, "cog / EQ / DY:\nopen or close the\npanel beside the\nchannel", head.x + 10, head.y + 118, FONT_TINY, COL_DIM)
 	}
 
-	chans := strip_channels(app, row)
+	// layout: each strip, followed by its open panels
+	Item :: struct {
+		x, w:  f32,
+		ch:    int,
+		panel: Maybe(Panel_Kind),
+	}
+	items := make([dynamic]Item, context.temp_allocator)
+	content_w: f32 = 0
+	for ch in strip_channels(app, row) {
+		append(&items, Item{x = content_w, w = STRIP_W, ch = ch})
+		content_w += STRIP_W
+		set := ui.panels[strip_key(row, ch)]
+		for kind in Panel_Kind {
+			if kind not_in set do continue
+			append(&items, Item{x = content_w, w = PANEL_W[kind] + PANEL_GAP, ch = ch, panel = kind})
+			content_w += PANEL_W[kind] + PANEL_GAP
+		}
+	}
 	view := rl.Rectangle{area.x + HEADER_W, area.y, area.width - HEADER_W, area.height - SCROLLBAR_H}
-	content_w := f32(len(chans)) * STRIP_W
 	max_scroll := max(0, content_w - view.width)
 
 	// horizontal scrolling: horizontal wheel, Ctrl+wheel, or the scrollbar
@@ -422,6 +506,16 @@ draw_row :: proc(ui: ^UI, row: Row, area: rl.Rectangle) {
 		wv := rl.GetMouseWheelMoveV()
 		dx := rl.IsKeyDown(.LEFT_CONTROL) ? wv.y : wv.x
 		ui.scroll[row] -= dx * STRIP_W * 2
+	}
+	// a panel that was just opened scrolls fully into view (once it is laid out)
+	if ui.reveal.pending && ui.reveal.row == row {
+		for it in items {
+			if k, ok := it.panel.?; ok && k == ui.reveal.kind && it.ch == ui.reveal.ch {
+				if it.x + it.w - ui.scroll[row] > view.width do ui.scroll[row] = it.x + it.w - view.width
+				if it.x - STRIP_W - ui.scroll[row] < 0 do ui.scroll[row] = max(0, it.x - STRIP_W)
+				ui.reveal.pending = false
+			}
+		}
 	}
 	bar := rl.Rectangle{view.x, view.y + view.height, view.width, SCROLLBAR_H}
 	if max_scroll > 0 {
@@ -445,12 +539,16 @@ draw_row :: proc(ui: ^UI, row: Row, area: rl.Rectangle) {
 		ui.scroll[row] = 0
 	}
 
-	clip_begin(ui, view)
-	defer clip_end(ui)
-	for ch, k in chans {
-		x := view.x + f32(k) * STRIP_W - ui.scroll[row]
-		if x + STRIP_W < view.x || x > view.x + view.width do continue
-		draw_strip(ui, row, ch, {x + 1, view.y + 2, STRIP_W - 2, view.height - 4})
+	prev := clip_push(ui, view)
+	defer clip_pop(ui, prev)
+	for it in items {
+		x := view.x + it.x - ui.scroll[row]
+		if x + it.w < view.x || x > view.x + view.width do continue
+		if kind, ok := it.panel.?; ok {
+			draw_panel(ui, row, it.ch, kind, {x + 1, view.y + 2, it.w - PANEL_GAP - 2, view.height - 4})
+		} else {
+			draw_strip(ui, row, it.ch, {x + 1, view.y + 2, STRIP_W - 2, view.height - 4})
+		}
 	}
 }
 
@@ -461,30 +559,17 @@ strip_name :: proc(app: ^App, row: Row, ch: int) -> string {
 	return name
 }
 
-open_editor :: proc(ui: ^UI, row: Row, ch: int) {
-	if ui.edit_ch != ch || ui.edit_row != row do ui.edit_scroll = 0
-	ui.edit_row, ui.edit_ch = row, ch
-}
-
 draw_strip :: proc(ui: ^UI, row: Row, ch: int, r: rl.Rectangle) {
 	app := ui.app
 	st := &app.st
 	stereo := ch % 2 == 0 && is_stereo(app, row, ch)
 	selected := row == .Output && ch == ui.submix
 	rl.DrawRectangleRounded(r, 0.06, 4, selected ? COL_STRIP_SEL : COL_STRIP)
-	if ui.edit_ch == ch && ui.edit_row == row do rl.DrawRectangleRoundedLinesEx(r, 0.06, 4, 1.5, COL_ACCENT)
 
 	base := fmt.tprintf("/%s/%d", ROW_BUS[row], ch)
 	x, w := r.x + 4, r.width - 8
 	y := r.y + 3
-
-	// name: double-click opens the channel settings; while they are open,
-	// a single click switches them to this channel
-	name_r := rl.Rectangle{r.x, y, r.width, 20}
-	text_centered(ui, strip_name(app, row, ch), name_r, FONT_NAME, selected ? rl.WHITE : COL_TEXT)
-	if row != .Playback && interactive(ui, name_r) && rl.IsMouseButtonPressed(.LEFT) {
-		if double_click(ui, widget_id(.Name, row, ch)) || ui.edit_ch >= 0 do open_editor(ui, row, ch)
-	}
+	text_centered(ui, strip_name(app, row, ch), {r.x, y, r.width, 20}, FONT_NAME, selected ? rl.WHITE : COL_TEXT)
 	y += 22
 
 	if row == .Input {
@@ -509,13 +594,22 @@ draw_strip :: proc(ui: ^UI, row: Row, ch: int, r: rl.Rectangle) {
 	}
 
 	if row != .Playback {
-		// mute, and EQ / dynamics state (click: open the channel settings)
-		bw := (w - 2 * CTL_GAP) / 3
-		toggle_param(ui, {x, y, bw, CTL_H}, "M", fmt.tprintf("%s/mute", base), COL_MUTE, FONT_TINY)
+		// mute + channel settings; EQ + dynamics (yellow = processing on).
+		// Each opens/closes its panel beside the strip.
+		half := (w - CTL_GAP) / 2
+		toggle_param(ui, {x, y, half, CTL_H}, "M", fmt.tprintf("%s/mute", base), COL_MUTE, FONT_TINY)
+		cog := rl.Rectangle{x + half + CTL_GAP, y, half, CTL_H}
+		if cog_button(ui, cog, panel_open(ui, row, ch, .Settings)) do toggle_panel(ui, row, ch, .Settings)
+		y += CTL_H + CTL_GAP
+
 		eq_on := state_get(st, fmt.tprintf("%s/eq/enable", base)) != 0 || state_get(st, fmt.tprintf("%s/lowcut/enable", base)) != 0
-		if button(ui, {x + bw + CTL_GAP, y, bw, CTL_H}, "EQ", eq_on, COL_EQ, FONT_TINY) do open_editor(ui, row, ch)
+		eq_r := rl.Rectangle{x, y, half, CTL_H}
+		if button(ui, eq_r, "EQ", eq_on, COL_ON, FONT_TINY) do toggle_panel(ui, row, ch, .EQ)
+		if panel_open(ui, row, ch, .EQ) do open_marker(eq_r)
 		dy_on := state_get(st, fmt.tprintf("%s/dynamics/enable", base)) != 0 || state_get(st, fmt.tprintf("%s/autolevel/enable", base)) != 0
-		if button(ui, {x + 2 * (bw + CTL_GAP), y, bw, CTL_H}, "DY", dy_on, COL_DYN, FONT_TINY) do open_editor(ui, row, ch)
+		dy_r := rl.Rectangle{x + half + CTL_GAP, y, half, CTL_H}
+		if button(ui, dy_r, "DY", dy_on, COL_ON, FONT_TINY) do toggle_panel(ui, row, ch, .Dynamics)
+		if panel_open(ui, row, ch, .Dynamics) do open_marker(dy_r)
 		y += CTL_H + CTL_GAP
 	}
 
@@ -566,26 +660,38 @@ draw_topbar :: proc(ui: ^UI, w: f32) {
 	app := ui.app
 	rl.DrawRectangleRec({0, 0, w, TOPBAR_H}, COL_STRIP)
 	text(ui, "oscmix", 14, 12, FONT_TITLE, COL_ACCENT)
+
+	// right: control room quick buttons, FX dock, settings
+	bx := w - 14 - 100
+	if button(ui, {bx, 9, 100, 28}, "Settings", ui.show_settings) {
+		ui.show_settings = !ui.show_settings
+		if ui.show_settings do settings_refresh(ui)
+	}
+	bx -= 6 + 56
+	if button(ui, {bx, 9, 56, 28}, "FX", ui.fx_dock) {
+		ui.fx_dock = !ui.fx_dock
+		prefs_save({scale = ui.scale, fx_dock = ui.fx_dock})
+	}
+	bx -= 16 + 64
+	toggle_param(ui, {bx, 9, 64, 28}, "MONO", "/controlroom/mainmono", COL_ON, FONT)
+	bx -= 6 + 56
+	toggle_param(ui, {bx, 9, 56, 28}, "DIM", "/controlroom/dim", COL_ON, FONT)
+
+	jack := ui.jack_saved
+	jtxt := jack.rate > 0 ? fmt.tprintf("JACK %d · %d×%d", jack.rate, jack.period, jack.nperiods) : "JACK: no jackd.env"
+	mode := ui.audio_mode != "" ? ui.audio_mode : "?"
+	info := fmt.tprintf("%s · %s · %d%%", jtxt, mode, int(ui.scale * 100 + 0.5))
+	iw := text_width(ui, info, FONT)
+	ix := bx - 16 - iw
+	text(ui, info, ix, 15, FONT, COL_DIM)
+
 	if app.connected {
 		dev := state_str(&app.st, "/device/name")
 		if dev == "" do dev = app.device
-		text(ui, fmt.tprintf("%s   ·   MIDI %d:%d", dev, app.midi.client, app.midi.port), 100, 15, FONT_NAME, COL_TEXT)
+		text_fit(ui, fmt.tprintf("%s · MIDI %d:%d", dev, app.midi.client, app.midi.port), 100, 15, ix - 116, FONT_NAME, COL_TEXT)
 	} else {
-		text(ui, app.error != "" ? app.error : "not connected", 100, 15, FONT_NAME, COL_RED)
-		if button(ui, {w - 340, 9, 80, 28}, "Retry") {
-			delete(app.error)
-			app.error = ""
-			app_connect(app, ui.port)
-		}
-	}
-	jack := ui.jack_saved
-	jtxt := jack.rate > 0 ? fmt.tprintf("JACK %d Hz · %d×%d", jack.rate, jack.period, jack.nperiods) : "JACK: no jackd.env"
-	mode := ui.audio_mode != "" ? ui.audio_mode : "?"
-	info := fmt.tprintf("%s   ·   mode %s   ·   %d %%", jtxt, mode, int(ui.scale * 100 + 0.5))
-	text(ui, info, w - 136 - text_width(ui, info, FONT), 15, FONT, COL_DIM)
-	if button(ui, {w - 120, 9, 106, 28}, "Settings", ui.show_settings) {
-		ui.show_settings = !ui.show_settings
-		if ui.show_settings do settings_refresh(ui)
+		if button(ui, {100, 9, 90, 28}, "Retry now") do app_connect(app, app.port)
+		text_fit(ui, app.error != "" ? app.error : "not connected", 200, 15, ix - 216, FONT_NAME, COL_RED)
 	}
 	if rl.GetTime() < ui.status_until {
 		sw := text_width(ui, ui.status, FONT) + 24
@@ -648,7 +754,7 @@ draw_settings :: proc(ui: ^UI, sw, sh: f32) {
 	cfg := ui.jack_cfg
 	if cfg.rate > 0 && cfg.period > 0 {
 		lat := f32(cfg.period * cfg.nperiods) / f32(cfg.rate) * 1000
-		text(ui, fmt.tprintf("output latency ≈ %.2f ms", lat), x + 260, y + 5, FONT, COL_DIM)
+		text(ui, fmt.tprintf("output latency ~ %.2f ms", lat), x + 260, y + 5, FONT, COL_DIM)
 	}
 	y += 38
 	dirty := cfg != ui.jack_saved
@@ -710,7 +816,7 @@ draw_confirm :: proc(ui: ^UI, sw, sh: f32) {
 		msg = fmt.tprintf("Restart jackd at %d Hz, %d×%d?\nAudio apps (REAPER) lose their JACK connection\nand must be restarted.", ui.jack_cfg.rate, ui.jack_cfg.period, ui.jack_cfg.nperiods)
 	case .Interface_Mode:
 		mode := INTERFACE_MODES[ui.iface_pending]
-		msg = mode == "CC" ? "Switch the interface to CC mode?\nThe unit restarts." : fmt.tprintf("Switch the interface to %s?\nThe unit restarts in driver mode: Linux has no driver for it,\nso audio and this app stop working. Switching back to CC\nneeds the front panel (SETUP → Options → Interface Mode).", mode)
+		msg = mode == "CC" ? "Switch the interface to CC mode?\nThe unit restarts." : fmt.tprintf("Switch the interface to %s?\nThe unit restarts in driver mode: Linux has no driver for it,\nso audio and this app stop working. Switching back to CC\nneeds the front panel (SETUP > Options > Interface Mode).", mode)
 	}
 	r := rl.Rectangle{(sw - 580) / 2, (sh - 210) / 2, 580, 210}
 	rl.DrawRectangleRec({0, 0, sw, sh}, {0, 0, 0, 140})
@@ -733,7 +839,7 @@ draw_confirm :: proc(ui: ^UI, sw, sh: f32) {
 			ui.jack_now = jack_live()
 		case .Interface_Mode:
 			app_send(ui.app, "/hardware/interfacemode", f32(ui.iface_pending))
-			set_status(ui, fmt.tprintf("interface mode → %s", INTERFACE_MODES[ui.iface_pending]))
+			set_status(ui, fmt.tprintf("interface mode: %s", INTERFACE_MODES[ui.iface_pending]))
 		}
 	}
 }
@@ -747,7 +853,7 @@ load_ui_font :: proc(ui: ^UI) {
 	if ui.font_path == "" do return
 	cps := make([dynamic]rune, context.temp_allocator)
 	for c in rune(32) ..< 256 do append(&cps, c)
-	append(&cps, '·', '→', '≈', '×', '…', '−')
+	append(&cps, '·', '×', '…', '−') // Noto Sans has no arrows or ≈
 	px := i32(clamp(math.round(FONT_TITLE * 1.6 * ui.scale), 24, 96))
 	f := rl.LoadFontEx(strings.clone_to_cstring(ui.font_path, context.temp_allocator), px, raw_data(cps), i32(len(cps)))
 	if f.glyphCount == 0 do return
@@ -762,7 +868,7 @@ ui_set_scale :: proc(ui: ^UI, scale: f32) {
 	ui.scale = s
 	rl.SetMouseScale(1 / s, 1 / s)
 	load_ui_font(ui)
-	prefs_save({scale = s})
+	prefs_save({scale = s, fx_dock = ui.fx_dock})
 }
 
 // Initial scale when nothing is saved: by monitor height.
@@ -784,7 +890,7 @@ handle_keys :: proc(ui: ^UI) {
 		} else if ui.show_settings {
 			ui.show_settings = false
 		} else {
-			ui.edit_ch = -1
+			clear(&ui.panels) // close every channel panel
 		}
 	}
 }
@@ -792,12 +898,14 @@ handle_keys :: proc(ui: ^UI) {
 // --- main loop ---------------------------------------------------------------------
 
 run_ui :: proc(app: ^App, port: string) {
-	ui := UI{app = app, port = port, iface_pending = -1, edit_ch = -1}
+	ui := UI{app = app, iface_pending = -1}
 	defer {
 		if ui.font_owned do rl.UnloadFont(ui.font)
 		delete(ui.font_path)
 		delete(ui.audio_mode)
 		delete(ui.status)
+		delete(ui.panels)
+		delete(ui.panel_scroll)
 	}
 	app_connect(app, port)
 
@@ -812,6 +920,7 @@ run_ui :: proc(app: ^App, port: string) {
 		ui.font_path = strings.clone(path)
 	}
 	prefs, has_prefs := prefs_load()
+	ui.fx_dock = prefs.fx_dock
 	ui_set_scale(&ui, has_prefs ? prefs.scale : default_scale())
 	settings_refresh(&ui)
 
@@ -821,14 +930,10 @@ run_ui :: proc(app: ^App, port: string) {
 		ui.wheel_used = false
 		// stereo pairs: always address the left channel
 		if ui.submix % 2 == 1 && is_stereo(app, .Output, ui.submix - 1) do ui.submix -= 1
-		if ui.edit_ch >= 0 {
-			if ui.edit_ch % 2 == 1 && is_stereo(app, ui.edit_row, ui.edit_ch - 1) do ui.edit_ch -= 1
-			if ui.edit_ch >= channel_count(app, ui.edit_row) do ui.edit_ch = -1
-		}
 
 		lw := f32(rl.GetScreenWidth()) / ui.scale
 		lh := f32(rl.GetScreenHeight()) / ui.scale
-		mix_w := ui.edit_ch >= 0 ? max(lw - EDITOR_W, 320) : lw
+		mix_w := ui.fx_dock ? max(lw - FX_DOCK_W, 320) : lw
 		rl.BeginDrawing()
 		rl.ClearBackground(COL_BG)
 		rl.BeginMode2D({zoom = ui.scale})
@@ -842,7 +947,7 @@ run_ui :: proc(app: ^App, port: string) {
 			draw_row(&ui, row, {0, y + 2, mix_w, h - 4})
 			y += h
 		}
-		if ui.edit_ch >= 0 do draw_editor(&ui, {mix_w + 2, TOPBAR_H + 2, lw - mix_w - 2, rows_h - 4})
+		if ui.fx_dock do draw_fx_dock(&ui, {mix_w + 2, TOPBAR_H + 2, lw - mix_w - 2, rows_h - 4})
 		ui.layer = .Settings
 		if ui.show_settings do draw_settings(&ui, lw, lh)
 		// the top bar stays usable while settings are open (its button closes them)

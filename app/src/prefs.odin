@@ -9,7 +9,8 @@ import "core:path/filepath"
 import "core:strings"
 
 Prefs :: struct {
-	scale: f32,
+	scale:   f32,
+	fx_dock: bool, // FX / control room dock open
 }
 
 @(private = "file")

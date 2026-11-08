@@ -99,6 +99,7 @@ foreign asound {
 
 Midi :: struct {
 	seq:       ^Seq,
+	watch:     ^Seq, // main-thread handle for port queries (see midi_port_present)
 	my_port:   c.int,
 	client:    int,
 	port:      int,
@@ -205,6 +206,7 @@ midi_close :: proc(m: ^Midi) {
 		thread.destroy(m.reader)
 	}
 	if m.seq != nil do snd_seq_close(m.seq)
+	if m.watch != nil do snd_seq_close(m.watch)
 	delete(m.sysex)
 	delete(m.inbox)
 	delete(m.drain)
@@ -272,8 +274,9 @@ midi_reader :: proc(data: rawptr) {
 	}
 }
 
-// Delivers every SysEx message received since the last call (main thread).
-midi_poll :: proc(m: ^Midi, on_sysex: proc(msg: []u8)) {
+// Delivers every SysEx message received since the last call (main thread);
+// returns how many there were.
+midi_poll :: proc(m: ^Midi, on_sysex: proc(msg: []u8)) -> (count: int) {
 	sync.mutex_lock(&m.lock)
 	m.inbox, m.drain = m.drain, m.inbox
 	sync.mutex_unlock(&m.lock)
@@ -283,6 +286,20 @@ midi_poll :: proc(m: ^Midi, on_sysex: proc(msg: []u8)) {
 		i += 4
 		on_sysex(m.drain[i:i + int(n)])
 		i += int(n)
+		count += 1
 	}
 	clear(&m.drain)
+	return
+}
+
+// True while the connected port still exists on the sequencer. Uses its own
+// handle: the main one is busy in the reader thread.
+midi_port_present :: proc(m: ^Midi) -> bool {
+	if m.watch == nil && snd_seq_open(&m.watch, "default", SND_SEQ_OPEN_DUPLEX, SND_SEQ_NONBLOCK) < 0 {
+		m.watch = nil
+		return true // cannot tell; rely on the receive timeout
+	}
+	ports := midi_find_rme_ports(m.watch, context.temp_allocator)
+	for p in ports do if p.client == m.client && p.port == m.port && p.name == m.port_name do return true
+	return false
 }

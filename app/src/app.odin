@@ -10,12 +10,20 @@ App :: struct {
 	midi:       Midi,
 	st:         State,
 	connected:  bool,
+	port:       string, // owned; requested "CLIENT:PORT", "" = auto-detect
 	error:      string, // owned; last connection error
 	device:     string, // owned; e.g. "Fireface UFX III (SERIAL) Port 4"
 	osc_buf:    [dynamic]u8,
 	last_tick:  time.Tick,
 	last_save:  time.Tick,
+	last_rx:    time.Tick, // last SysEx from the interface
+	last_check: time.Tick, // last port check / reconnect attempt
 }
+
+// The interface streams meter replies continuously while connected; this
+// long without any input means it is gone (unplugged, powered off, mode change).
+RX_TIMEOUT_SECONDS :: 5.0
+WATCH_SECONDS :: 2.0
 
 @(private = "file")
 engine_midi_out :: proc "c" (user: rawptr, buf: [^]u8, len: u32) {
@@ -39,9 +47,14 @@ on_sysex :: proc(msg: []u8) {
 }
 
 // Connects to the interface (port "CLIENT:PORT" or auto-detect) and starts the engine.
-// The engine can only be instantiated once per process.
 app_connect :: proc(app: ^App, port: string = "") -> bool {
 	app.ctx = context
+	if port != app.port {
+		delete(app.port)
+		app.port = strings.clone(port)
+	}
+	delete(app.error)
+	app.error = ""
 	if err := midi_open(&app.midi, port); err != "" {
 		app.error = err
 		midi_close(&app.midi)
@@ -53,13 +66,27 @@ app_connect :: proc(app: ^App, port: string = "") -> bool {
 		midi_close(&app.midi)
 		return false
 	}
+	delete(app.device)
 	app.device = strings.clone(app.midi.port_name)
 	app.connected = true
 	app.last_tick = time.tick_now()
-	app.last_save = app.last_tick
+	app.last_save, app.last_rx, app.last_check = app.last_tick, app.last_tick, app.last_tick
 	app_send(app, "/device/info")
 	app_send(app, "/refresh")
 	return true
+}
+
+// Drops the connection (engine + MIDI) but keeps the parameter mirror, so the
+// window keeps showing the last known state until the interface is back.
+app_disconnect :: proc(app: ^App, reason: string) {
+	if !app.connected do return
+	state_save_mix(&app.st)
+	engine_close()
+	midi_close(&app.midi)
+	app.connected = false
+	delete(app.error)
+	app.error = strings.clone(reason)
+	app.last_check = time.tick_now()
 }
 
 app_shutdown :: proc(app: ^App) {
@@ -72,6 +99,7 @@ app_shutdown :: proc(app: ^App) {
 	delete(app.osc_buf)
 	delete(app.error)
 	delete(app.device)
+	delete(app.port)
 }
 
 // Sends one OSC message (float args) into the engine.
@@ -89,12 +117,32 @@ app_send :: proc(app: ^App, addr: string, args: ..f32) {
 	if msg.argc > 0 do state_apply(&app.st, &msg)
 }
 
-// Pumps MIDI input and the engine timer. Call often (every frame).
-app_poll :: proc(app: ^App, levels := true) {
-	if !app.connected do return
-	midi_poll(&app.midi, on_sysex)
-	if time.duration_seconds(time.tick_since(app.last_tick)) >= ENGINE_TICK_SECONDS {
-		app.last_tick = time.tick_now()
+// Pumps MIDI input and the engine timer, and watches the connection: drops it
+// when the port vanishes or goes silent, and reconnects (with `reconnect`)
+// every WATCH_SECONDS while disconnected. Call often (every frame).
+app_poll :: proc(app: ^App, levels := true, reconnect := true) {
+	now := time.tick_now()
+	if !app.connected {
+		if reconnect && time.duration_seconds(time.tick_diff(app.last_check, now)) >= WATCH_SECONDS {
+			app.last_check = now
+			app_connect(app, app.port)
+		}
+		return
+	}
+	if midi_poll(&app.midi, on_sysex) > 0 do app.last_rx = now
+	if time.duration_seconds(time.tick_diff(app.last_check, now)) >= WATCH_SECONDS {
+		app.last_check = now
+		if !midi_port_present(&app.midi) {
+			app_disconnect(app, "interface disconnected, reconnecting…")
+			return
+		}
+	}
+	if time.duration_seconds(time.tick_diff(app.last_rx, now)) >= RX_TIMEOUT_SECONDS {
+		app_disconnect(app, "interface not responding, reconnecting…")
+		return
+	}
+	if time.duration_seconds(time.tick_diff(app.last_tick, now)) >= ENGINE_TICK_SECONDS {
+		app.last_tick = now
 		engine_timer(levels ? 1 : 0)
 	}
 	// Saved mix is per device (serial in the uid), known once the engine reports it.
@@ -104,8 +152,8 @@ app_poll :: proc(app: ^App, levels := true) {
 			state_load_mix(&app.st)
 		}
 	}
-	if app.st.mix_dirty && time.duration_seconds(time.tick_since(app.last_save)) >= 2 {
-		app.last_save = time.tick_now()
+	if app.st.mix_dirty && time.duration_seconds(time.tick_diff(app.last_save, now)) >= 2 {
+		app.last_save = now
 		state_save_mix(&app.st)
 	}
 }
