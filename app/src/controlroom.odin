@@ -13,7 +13,7 @@ import rl "../raylib"
 CR_STRIP_W :: 80
 CR_MIN_W :: 200
 CR_PAD :: 8
-CR_HEAD_H :: 78 // title, DIM / MONO / RECALL, strip tags
+CR_HEAD_H :: 172 // title, DIM / MONO / RECALL, snapshots, strip tags
 CR_PANEL_ORDER := [?]Panel_Kind{.Room_EQ, .Dynamics, .EQ, .Settings}
 
 // Left channel of the pair `ch` belongs to.
@@ -100,6 +100,32 @@ draw_control_room :: proc(ui: ^UI, area: rl.Rectangle) {
 	toggle_param(ui, {bx + bw + 5, area.y + 26, bw, 26}, "MONO", "/controlroom/mainmono", COL_ON, FONT)
 	if button(ui, {bx + 2 * (bw + 5), area.y + 26, bw, 26}, "RECALL") && main >= 0 {
 		app_send(app, fmt.tprintf("/output/%d/volume", main), state_get(&app.st, "/controlroom/recallvolume", -10))
+	}
+
+	// snapshots (TotalMix-style): click recalls; Store, then a slot, stores
+	sy := area.y + 62
+	text(ui, "SNAPSHOTS", right - 184, sy + 5, FONT_SMALL, COL_DIM)
+	if button(ui, {right - 70, sy, 70, 24}, "Store", ui.snap_store, COL_MUTE, FONT_SMALL) do ui.snap_store = !ui.snap_store
+	sw: f32 = (184 - 3 * 4) / 4
+	for slot in 0 ..< SNAPSHOT_SLOTS {
+		if slot >= len(app.dev.snapshots) do break
+		s := &app.dev.snapshots[slot]
+		r := rl.Rectangle{right - 184 + f32(slot % 4) * (sw + 4), sy + 30 + f32(slot / 4) * 28, sw, 24}
+		label := s.name != "" ? s.name : fmt.tprintf("%d", slot + 1)
+		hot := interactive(ui, r)
+		bg := ui.snap_active == slot ? COL_ACCENT : (hot ? COL_BUTTON_HOT : COL_BUTTON)
+		if ui.snap_store do bg = hot ? COL_MUTE : rl.Color{110, 52, 48, 255}
+		rl.DrawRectangleRounded(r, 0.25, 4, bg)
+		text_centered(ui, label, r, FONT_TINY, s.name != "" || ui.snap_store ? rl.WHITE : COL_DIM)
+		if !hot || !rl.IsMouseButtonPressed(.LEFT) do continue
+		if ui.snap_store {
+			ui.snap_store = false
+			open_snapshot_store(ui, slot)
+		} else if s.name != "" && app.connected {
+			n := snapshot_recall(app, slot)
+			ui.snap_active = slot
+			set_status(ui, n == 0 ? fmt.tprintf("snapshot \"%s\": already current", s.name) : fmt.tprintf("recalling snapshot \"%s\" (%d changes)", s.name, n))
+		}
 	}
 
 	outs := cr_outputs(ui)

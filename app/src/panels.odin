@@ -742,10 +742,13 @@ draw_panel :: proc(ui: ^UI, row: Row, ch: int, kind: Panel_Kind, r: rl.Rectangle
 	avail := content.height - 6
 	switch kind {
 	case .Settings:
-		if row == .Input {
+		switch row {
+		case .Input:
 			panel_input_settings(&e)
-		} else {
+		case .Output:
 			panel_output_settings(&e)
+		case .Playback:
+			panel_playback_settings(&e)
 		}
 	case .EQ:
 		panel_eq(&e, avail)
@@ -774,8 +777,41 @@ draw_panel :: proc(ui: ^UI, row: Row, ch: int, kind: Panel_Kind, r: rl.Rectangle
 	}
 }
 
+// Name (local rename) and fader / mute group membership rows.
+ed_name_groups :: proc(e: ^Ed) {
+	ui := e.ui
+	ed_label(e, "Name")
+	if button(ui, ed_field(e), fmt.tprintf("%s  (rename)", strip_name(ui.app, e.row, e.ch)), false, COL_ACCENT, FONT_SMALL) {
+		open_rename(ui, e.row, e.ch)
+	}
+	ed_next(e)
+	bits := group_bits(ui.app, e.row, e.ch)
+	kinds := e.row == .Playback ? 1 : 2 // playbacks have no mute
+	for kind in 0 ..< kinds {
+		ed_label(e, kind == 0 ? "Fader group" : "Mute group")
+		f := ed_field(e)
+		bw := (f.width - 3 * 4) / GROUPS
+		for g in 0 ..< GROUPS {
+			bit := uint(g + kind * 4)
+			on := bits & (1 << bit) != 0
+			if button(ui, {f.x + f32(g) * (bw + 4), f.y, bw, f.height}, fmt.tprintf("%d", g + 1), on, GROUP_COL[g], FONT_SMALL) {
+				group_toggle(ui.app, e.row, e.ch, bit)
+			}
+		}
+		ed_next(e)
+	}
+	e.y += 4
+}
+
+panel_playback_settings :: proc(e: ^Ed) {
+	e.label_w = 76
+	ed_name_groups(e)
+	if e.stereo do ed_slider(e, "Width", "width", SL_WIDTH)
+}
+
 panel_input_settings :: proc(e: ^Ed) {
 	e.label_w = 76
+	ed_name_groups(e)
 	toggles := make([dynamic]Ed_Toggle, context.temp_allocator)
 	append(&toggles, Ed_Toggle{"48V", "48v", COL_PHANTOM, 0}, Ed_Toggle{"Hi-Z", "instrument", COL_ACCENT, 0}, Ed_Toggle{"AutoSet", "autoset", COL_ACCENT, 0})
 	if e.stereo {
@@ -793,6 +829,7 @@ panel_input_settings :: proc(e: ^Ed) {
 
 panel_output_settings :: proc(e: ^Ed) {
 	e.label_w = 76
+	ed_name_groups(e)
 	toggles := make([dynamic]Ed_Toggle, context.temp_allocator)
 	if e.stereo {
 		append(&toggles, Ed_Toggle{"Phase L", "phase", COL_ACCENT, 0}, Ed_Toggle{"Phase R", "phase", COL_ACCENT, 1})

@@ -18,7 +18,20 @@ App :: struct {
 	last_save:  time.Tick,
 	last_rx:    time.Tick, // last SysEx from the interface
 	last_check: time.Tick, // last port check / reconnect attempt
+	queue:      [dynamic]Queued_Write, // paced bulk writes
+	queue_pos:  int, // next to send
+	dev:        Device_Data, // local per-device data (names, groups, snapshots)
 }
+
+Queued_Write :: struct {
+	addr: string, // owned
+	v:    f32,
+}
+
+// The interface silently drops writes sent in a burst (3760 at once: only
+// ~5% applied); 50 per 2 ms with MIDI serviced in between all landed
+// (tested). 100 per frame (~6000/s at 60 fps) stays well below that.
+QUEUE_PER_POLL :: 100
 
 // The interface streams meter replies continuously while connected; this
 // long without any input means it is gone (unplugged, powered off, mode change).
@@ -84,6 +97,7 @@ app_disconnect :: proc(app: ^App, reason: string) {
 	engine_close()
 	midi_close(&app.midi)
 	app.connected = false
+	app_queue_clear(app) // unsent writes are void; the state is re-read on reconnect
 	delete(app.error)
 	app.error = strings.clone(reason)
 	app.last_check = time.tick_now()
@@ -96,6 +110,9 @@ app_shutdown :: proc(app: ^App) {
 		midi_close(&app.midi)
 	}
 	state_destroy(&app.st)
+	app_queue_clear(app)
+	delete(app.queue)
+	devdata_destroy(&app.dev)
 	delete(app.osc_buf)
 	delete(app.error)
 	delete(app.device)
@@ -115,6 +132,22 @@ app_send :: proc(app: ^App, addr: string, args: ..f32) {
 		msg.argc += 1
 	}
 	if msg.argc > 0 do state_apply(&app.st, &msg)
+}
+
+// Queues a write for paced sending by app_poll (bulk changes).
+app_queue :: proc(app: ^App, addr: string, v: f32) {
+	append(&app.queue, Queued_Write{strings.clone(addr), v})
+}
+
+app_queue_clear :: proc(app: ^App) {
+	for w in app.queue do delete(w.addr)
+	clear(&app.queue)
+	app.queue_pos = 0
+}
+
+// (sent, total) of the pending bulk writes; total 0 when idle.
+app_queue_progress :: proc(app: ^App) -> (sent, total: int) {
+	return app.queue_pos, len(app.queue)
 }
 
 // Pumps MIDI input and the engine timer, and watches the connection: drops it
@@ -145,13 +178,24 @@ app_poll :: proc(app: ^App, levels := true, reconnect := true) {
 		app.last_tick = now
 		engine_timer(levels ? 1 : 0)
 	}
-	// Saved mix is per device (serial in the uid), known once the engine reports it.
+	// Saved mix and local device data are per device (serial in the uid),
+	// known once the engine reports it.
 	if app.st.mix_path == "" {
 		if uid := state_str(&app.st, "/device/uid"); uid != "" {
 			state_set_mix_path(&app.st, uid)
 			state_load_mix(&app.st)
+			devdata_load(app, uid)
 		}
 	}
+	// paced bulk writes (snapshot recall): bursts are dropped by the interface
+	n := 0
+	for app.queue_pos < len(app.queue) && n < QUEUE_PER_POLL {
+		w := app.queue[app.queue_pos]
+		app_send(app, w.addr, w.v)
+		app.queue_pos += 1
+		n += 1
+	}
+	if app.queue_pos > 0 && app.queue_pos == len(app.queue) do app_queue_clear(app)
 	if app.st.mix_dirty && time.duration_seconds(time.tick_diff(app.last_save, now)) >= 2 {
 		app.last_save = now
 		state_save_mix(&app.st)

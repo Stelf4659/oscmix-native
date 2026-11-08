@@ -35,6 +35,7 @@ HEADER_W :: 112
 TOPBAR_H :: 46
 SCROLLBAR_H :: 12
 COL_ON :: rl.Color{226, 184, 48, 255} // "processing on" (EQ, dynamics, …), as in TotalMix
+GROUP_COL := [GROUPS]rl.Color{{232, 120, 60, 255}, {90, 200, 210, 255}, {200, 110, 220, 255}, {150, 210, 90, 255}}
 CTL_H :: 18 // strip control height
 CTL_GAP :: 3
 
@@ -101,6 +102,8 @@ Confirm_Action :: enum {
 	Main_Out,
 	Save_Preset,
 	Delete_Preset,
+	Save_Snapshot,
+	Rename,
 }
 
 Reveal :: struct {
@@ -143,8 +146,12 @@ UI :: struct {
 	presets:      Preset_File,
 	popup:        Popup, // preset list of one panel
 	in_popup:     bool, // drawing the popup (it is exempt from its own input block)
-	preset_target: Preset_Target, // save / delete dialog subject
-	text:         strings.Builder, // save dialog name field
+	preset_target: Preset_Target, // dialog subject (preset save/delete, snapshot slot, rename)
+	text:         strings.Builder, // dialog name field
+	snap_store:   bool, // Store armed: the next slot click stores
+	snap_active:  int, // last stored/recalled snapshot slot, -1 none
+	snap_unknown: int, // unknown sends when the store dialog opened
+	snap_unknown_off: bool, // store dialog choice: unknown sends stored as off
 	// settings
 	show_settings: bool,
 	jack_cfg:      Jack_Settings, // pending edit
@@ -469,7 +476,13 @@ is_stereo :: proc(app: ^App, row: Row, i: int) -> bool {
 	return state_get(&app.st, fmt.tprintf("/%s/%d/stereo", ROW_BUS[row], i)) != 0
 }
 
+// Local name if set (see devdata.odin), else the interface's.
 channel_name :: proc(app: ^App, row: Row, i: int) -> string {
+	if n := local_name(app, row, i); n != "" do return n
+	return interface_name(app, row, i)
+}
+
+interface_name :: proc(app: ^App, row: Row, i: int) -> string {
 	n := state_str(&app.st, fmt.tprintf("/%s/%d/name", ROW_BUS[row], i))
 	if n == "" && row == .Playback {
 		// playbacks are named after the output they belong to
@@ -594,10 +607,12 @@ draw_row :: proc(ui: ^UI, row: Row, area: rl.Rectangle) {
 	}
 }
 
-// "AN 1/AN 2" for stereo pairs
+// "AN 1/AN 2" for stereo pairs; a local name on the left channel names the pair.
 strip_name :: proc(app: ^App, row: Row, ch: int) -> string {
 	name := channel_name(app, row, ch)
-	if ch % 2 == 0 && is_stereo(app, row, ch) do name = fmt.tprintf("%s/%s", name, channel_name(app, row, ch + 1))
+	if ch % 2 == 0 && is_stereo(app, row, ch) && local_name(app, row, ch) == "" {
+		name = fmt.tprintf("%s/%s", name, channel_name(app, row, ch + 1))
+	}
 	return name
 }
 
@@ -611,7 +626,11 @@ draw_strip :: proc(ui: ^UI, row: Row, ch: int, r: rl.Rectangle) {
 	base := fmt.tprintf("/%s/%d", ROW_BUS[row], ch)
 	x, w := r.x + 4, r.width - 8
 	y := r.y + 3
-	text_centered(ui, strip_name(app, row, ch), {r.x, y, r.width, 20}, FONT_NAME, selected ? rl.WHITE : COL_TEXT)
+	name_r := rl.Rectangle{r.x, y, r.width, 20}
+	text_centered(ui, strip_name(app, row, ch), name_r, FONT_NAME, selected ? rl.WHITE : COL_TEXT)
+	if interactive(ui, name_r) && rl.IsMouseButtonPressed(.LEFT) && double_click(ui, widget_id(.Name, row, ch)) {
+		open_rename(ui, row, ch)
+	}
 	y += 22
 
 	if row == .Input {
@@ -635,11 +654,21 @@ draw_strip :: proc(ui: ^UI, row: Row, ch: int, r: rl.Rectangle) {
 		y += CTL_H + CTL_GAP
 	}
 
-	if row != .Playback {
+	if row == .Playback {
+		// channel settings (name, width, groups)
+		cog := rl.Rectangle{x, y, w, CTL_H}
+		if cog_button(ui, cog, panel_open(ui, row, ch, .Settings)) do toggle_panel(ui, row, ch, .Settings)
+		y += CTL_H + CTL_GAP
+	} else {
 		// mute + channel settings; EQ + dynamics (yellow = processing on).
 		// Each opens/closes its panel beside the strip.
 		half := (w - CTL_GAP) / 2
-		toggle_param(ui, {x, y, half, CTL_H}, "M", fmt.tprintf("%s/mute", base), COL_MUTE, FONT_TINY)
+		maddr := fmt.tprintf("%s/mute", base)
+		muted := state_get(st, maddr) != 0
+		if button(ui, {x, y, half, CTL_H}, "M", muted, COL_MUTE, FONT_TINY) {
+			app_send(app, maddr, muted ? 0 : 1)
+			group_mute_set(app, row, ch, muted ? 0 : 1)
+		}
 		cog := rl.Rectangle{x + half + CTL_GAP, y, half, CTL_H}
 		if cog_button(ui, cog, panel_open(ui, row, ch, .Settings)) do toggle_panel(ui, row, ch, .Settings)
 		y += CTL_H + CTL_GAP
@@ -676,13 +705,30 @@ draw_strip :: proc(ui: ^UI, row: Row, ch: int, r: rl.Rectangle) {
 	known := state_has(st, faddr)
 	db := state_get(st, faddr, off)
 	text_centered(ui, known ? fmt_db(db) : "?", {r.x, y, r.width, 16}, FONT_SMALL, known ? COL_TEXT : COL_DIM)
+	// group membership: fader group left (F1-F4), mute group right (M1-M4)
+	bits := group_bits(app, row, ch)
+	for g in 0 ..< GROUPS {
+		if bits & (1 << uint(g)) != 0 {
+			text(ui, fmt.tprintf("F%d", g + 1), r.x + 3, y + 2, FONT_TINY, GROUP_COL[g])
+			break
+		}
+	}
+	for g in 0 ..< GROUPS {
+		if bits & (1 << uint(g + 4)) != 0 {
+			text(ui, fmt.tprintf("M%d", g + 1), r.x + r.width - 18, y + 2, FONT_TINY, GROUP_COL[g])
+			break
+		}
+	}
 	y += 18
 
 	// fader + meter(s)
 	fr := rl.Rectangle{r.x + 2, y, r.width - 24, r.y + r.height - y - 4}
 	if fr.height > 40 {
 		new_db, changed := fader(ui, widget_id(.Fader, row, ch), fr, db, off, known)
-		if changed do app_send(app, faddr, new_db)
+		if changed {
+			app_send(app, faddr, new_db)
+			if known do group_fader_moved(app, row, ch, ui.submix, db, new_db)
+		}
 		pk, rms := level_of(app, row, ch)
 		mw: f32 = stereo ? 5 : 10
 		meter({r.x + r.width - 19, fr.y + 8, mw, fr.height - 16}, pk, rms)
@@ -731,7 +777,14 @@ draw_topbar :: proc(ui: ^UI, w: f32) {
 		if button(ui, {100, 9, 90, 28}, "Retry now") do app_connect(app, app.port)
 		text_fit(ui, app.error != "" ? app.error : "not connected", 200, 15, ix - 216, FONT_NAME, COL_RED)
 	}
-	if rl.GetTime() < ui.status_until {
+	if sent, total := app_queue_progress(app); total > 0 {
+		msg := fmt.tprintf("sending to the interface: %d / %d", sent, total)
+		sw := text_width(ui, msg, FONT) + 24
+		r := rl.Rectangle{(w - sw) / 2, TOPBAR_H + 6, sw, 28}
+		rl.DrawRectangleRounded(r, 0.3, 4, {20, 22, 26, 235})
+		rl.DrawRectangleRounded({r.x, r.y + r.height - 3, r.width * f32(sent) / f32(total), 3}, 1, 4, COL_ACCENT)
+		text_centered(ui, msg, r, FONT)
+	} else if rl.GetTime() < ui.status_until {
 		sw := text_width(ui, ui.status, FONT) + 24
 		r := rl.Rectangle{(w - sw) / 2, TOPBAR_H + 6, sw, 28}
 		rl.DrawRectangleRounded(r, 0.3, 4, {20, 22, 26, 235})
@@ -850,8 +903,8 @@ draw_confirm :: proc(ui: ^UI, sw, sh: f32) {
 	switch ui.confirm {
 	case .None:
 		return
-	case .Save_Preset:
-		draw_save_preset(ui, sw, sh)
+	case .Save_Preset, .Save_Snapshot, .Rename:
+		draw_text_dialog(ui, sw, sh)
 		return
 	case .Jack_Restart:
 		msg = fmt.tprintf("Restart jackd at %d Hz, %d×%d?\nAudio apps (REAPER) lose their JACK connection\nand must be restarted.", ui.jack_cfg.rate, ui.jack_cfg.period, ui.jack_cfg.nperiods)
@@ -873,7 +926,7 @@ draw_confirm :: proc(ui: ^UI, sw, sh: f32) {
 		action := ui.confirm
 		ui.confirm = .None
 		switch action {
-		case .None, .Save_Preset:
+		case .None, .Save_Preset, .Save_Snapshot, .Rename:
 		case .Jack_Restart:
 			if !jack_env_write(ui.jack_cfg) {
 				set_status(ui, "could not write ~/.config/jackd/jackd.env")
@@ -896,19 +949,63 @@ draw_confirm :: proc(ui: ^UI, sw, sh: f32) {
 	}
 }
 
-// Name entry for saving the subject panel's settings as a preset.
-draw_save_preset :: proc(ui: ^UI, sw, sh: f32) {
+// Opens the rename dialog for a channel (prefilled with its current name).
+open_rename :: proc(ui: ^UI, row: Row, ch: int) {
+	ui.preset_target = {row = row, ch = ch}
+	strings.builder_reset(&ui.text)
+	strings.write_string(&ui.text, channel_name(ui.app, row, ch))
+	ui.confirm = .Rename
+}
+
+// Opens the store dialog for a snapshot slot.
+open_snapshot_store :: proc(ui: ^UI, slot: int) {
+	ui.preset_target = {index = slot}
+	strings.builder_reset(&ui.text)
+	name := ui.app.dev.snapshots[slot].name
+	strings.write_string(&ui.text, name != "" ? name : fmt.tprintf("Snapshot %d", slot + 1))
+	_, ui.snap_unknown, _ = snapshot_capture(ui.app, false)
+	ui.snap_unknown_off = false
+	ui.confirm = .Save_Snapshot
+}
+
+// Name entry dialog: preset save, snapshot store, channel rename.
+draw_text_dialog :: proc(ui: ^UI, sw, sh: f32) {
 	t := ui.preset_target
+	app := ui.app
 	for c := rl.GetCharPressed(); c != 0; c = rl.GetCharPressed() {
 		if c >= 32 && c < 256 && c != 127 && strings.builder_len(ui.text) < 40 do strings.write_rune(&ui.text, c)
 	}
 	if rl.IsKeyPressed(.BACKSPACE) || rl.IsKeyPressedRepeat(.BACKSPACE) do strings.pop_rune(&ui.text)
 	name := strings.trim_space(strings.to_string(ui.text))
 
-	r := rl.Rectangle{(sw - 520) / 2, (sh - 200) / 2, 520, 200}
+	title, hint, ok_label: string
+	allow_empty := true
+	#partial switch ui.confirm {
+	case .Save_Preset:
+		title = fmt.tprintf("Save %s preset from %s", PANEL_TITLE[t.kind], strip_name(app, t.row, t.ch))
+		hint = "Type a name; Enter saves, Esc cancels."
+		for p in presets_of(&ui.presets, t.kind) do if p.name == name do hint = "Replaces the existing preset with this name."
+		ok_label, allow_empty = "Save", false
+	case .Save_Snapshot:
+		title = fmt.tprintf("Store snapshot %d (the whole mix)", t.index + 1)
+		hint = name == "" ? "An empty name clears this slot." : "Enter stores, Esc cancels."
+		if ui.snap_unknown > 0 && name != "" {
+			hint = fmt.tprintf("%d send levels are unknown to this app (the interface does\nnot report them). Leave them as they are on recall, or store\nthem as off so the snapshot sets every send.", ui.snap_unknown)
+		}
+		ok_label = name == "" ? "Clear" : "Store"
+	case .Rename:
+		title = fmt.tprintf("Rename %s", strip_name(app, t.row, t.ch))
+		hint = "Stored on this computer (the interface does not keep names).\nAn empty name returns to the interface's name."
+		ok_label = "Rename"
+	case:
+		return
+	}
+
+	dh: f32 = ui.confirm == .Save_Snapshot && ui.snap_unknown > 0 ? 300 : 240
+	r := rl.Rectangle{(sw - 560) / 2, (sh - dh) / 2, 560, dh}
 	rl.DrawRectangleRec({0, 0, sw, sh}, {0, 0, 0, 140})
 	rl.DrawRectangleRounded(r, 0.05, 6, COL_ROW)
-	text(ui, fmt.tprintf("Save %s preset from %s", PANEL_TITLE[t.kind], strip_name(ui.app, t.row, t.ch)), r.x + 20, r.y + 18, FONT_HEAD)
+	text(ui, title, r.x + 20, r.y + 18, FONT_HEAD)
 	field := rl.Rectangle{r.x + 20, r.y + 54, r.width - 40, 34}
 	rl.DrawRectangleRounded(field, 0.2, 4, COL_TRACK)
 	rl.DrawRectangleRoundedLinesEx(field, 0.2, 4, 1, COL_ACCENT)
@@ -918,18 +1015,40 @@ draw_save_preset :: proc(ui: ^UI, sw, sh: f32) {
 		cx := field.x + 11 + text_width(ui, typed, FONT_NAME)
 		rl.DrawLineEx({cx, field.y + 7}, {cx, field.y + field.height - 7}, 1.5, COL_TEXT)
 	}
-	hint := "Type a name; Enter saves, Esc cancels."
-	for p in presets_of(&ui.presets, t.kind) do if p.name == name do hint = "Replaces the existing preset with this name."
 	text(ui, hint, field.x, field.y + field.height + 8, FONT_SMALL, COL_DIM)
+	if ui.confirm == .Save_Snapshot && ui.snap_unknown > 0 && name != "" {
+		cy := r.y + r.height - 90
+		text(ui, "Unknown sends:", field.x, cy + 6, FONT, COL_TEXT)
+		bw: f32 = 150
+		if button(ui, {field.x + 120, cy, bw, 28}, "Leave as they are", !ui.snap_unknown_off, COL_ACCENT, FONT_SMALL) do ui.snap_unknown_off = false
+		if button(ui, {field.x + 126 + bw, cy, bw, 28}, "Set off", ui.snap_unknown_off, COL_MUTE, FONT_SMALL) do ui.snap_unknown_off = true
+	}
 
 	if button(ui, {r.x + r.width - 230, r.y + r.height - 48, 100, 32}, "Cancel") do ui.confirm = .None
-	save := button(ui, {r.x + r.width - 120, r.y + r.height - 48, 100, 32}, "Save", name != "") || rl.IsKeyPressed(.ENTER) || rl.IsKeyPressed(.KP_ENTER)
-	if save && name != "" {
+	can := allow_empty || name != ""
+	ok := button(ui, {r.x + r.width - 120, r.y + r.height - 48, 100, 32}, ok_label, can) || rl.IsKeyPressed(.ENTER) || rl.IsKeyPressed(.KP_ENTER)
+	if !ok || !can do return
+	#partial switch ui.confirm {
+	case .Save_Preset:
 		e := channel_ed(ui, t.row, t.ch)
-		ok := preset_store(&ui.presets, t.kind, &e, name)
-		set_status(ui, ok ? fmt.tprintf("%s preset \"%s\" saved", PANEL_TITLE[t.kind], name) : "could not save presets.json")
-		ui.confirm = .None
+		saved := preset_store(&ui.presets, t.kind, &e, name)
+		set_status(ui, saved ? fmt.tprintf("%s preset \"%s\" saved", PANEL_TITLE[t.kind], name) : "could not save presets.json")
+	case .Save_Snapshot:
+		saved: bool
+		if name == "" {
+			saved = snapshot_clear(app, t.index)
+			if ui.snap_active == t.index do ui.snap_active = -1
+		} else {
+			values, _, all_sends := snapshot_capture(app, ui.snap_unknown_off)
+			saved = snapshot_store(app, t.index, name, values, all_sends)
+			ui.snap_active = t.index
+		}
+		set_status(ui, saved ? fmt.tprintf("snapshot %d %s", t.index + 1, name == "" ? "cleared" : "stored") : "could not save the device file")
+	case .Rename:
+		// the interface's own name needs no local override
+		set_local_name(app, t.row, t.ch, name == interface_name(app, t.row, t.ch) ? "" : name)
 	}
+	ui.confirm = .None
 }
 
 // --- scale & fonts -------------------------------------------------------------------
@@ -988,7 +1107,7 @@ handle_keys :: proc(ui: ^UI) {
 // --- main loop ---------------------------------------------------------------------
 
 run_ui :: proc(app: ^App, port: string) {
-	ui := UI{app = app, iface_pending = -1}
+	ui := UI{app = app, iface_pending = -1, snap_active = -1}
 	defer {
 		if ui.font_owned do rl.UnloadFont(ui.font)
 		delete(ui.font_path)
