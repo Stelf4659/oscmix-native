@@ -8,6 +8,7 @@ package oscmix_native
 
 import "core:fmt"
 import "core:math"
+import "core:strings"
 import rl "../raylib"
 
 // --- value slider ------------------------------------------------------------
@@ -680,7 +681,7 @@ toggle_panel :: proc(ui: ^UI, row: Row, ch: int, kind: Panel_Kind) {
 	} else {
 		ui.panels[key] = set
 	}
-	if kind in set {
+	if kind in set && !(row == .Output && is_cr_output(ui, ch)) {
 		ui.reveal = Reveal{row = row, ch = ch, kind = kind, pending = true}
 	}
 }
@@ -699,13 +700,7 @@ PANEL_TOGGLES := [Panel_Kind][]Header_Toggle {
 
 draw_panel :: proc(ui: ^UI, row: Row, ch: int, kind: Panel_Kind, r: rl.Rectangle) {
 	app := ui.app
-	e := Ed {
-		ui     = ui,
-		row    = row,
-		ch     = ch,
-		stereo = ch % 2 == 0 && is_stereo(app, row, ch),
-		base   = fmt.tprintf("/%s/%d", ROW_BUS[row], ch),
-	}
+	e := channel_ed(ui, row, ch)
 	rl.DrawRectangleRounded(r, 0.025, 4, COL_PANEL)
 	rl.DrawRectangleRoundedLinesEx(r, 0.025, 4, 1, COL_BUTTON_HOT)
 
@@ -724,6 +719,17 @@ draw_panel :: proc(ui: ^UI, row: Row, ch: int, kind: Panel_Kind, r: rl.Rectangle
 		bx -= bw + 5
 		on := ed_get(&e, t.sub) != 0
 		if button(ui, {bx, r.y + 6, bw, 24}, t.label, on, COL_ON, FONT) do ed_set(&e, t.sub, on ? 0 : 1)
+	}
+	if kind != .Settings {
+		bw := text_width(ui, "Presets", FONT) + 22
+		bx -= bw + 5
+		anchor := rl.Rectangle{bx, r.y + 6, bw, 24}
+		mine := ui.popup.open && ui.popup.row == row && ui.popup.ch == ch && ui.popup.kind == kind
+		if button(ui, anchor, "Presets", mine, COL_ACCENT, FONT) {
+			ui.popup = mine ? {} : Popup{open = true, row = row, ch = ch, kind = kind}
+			mine = !mine
+		}
+		if mine do ui.popup.anchor, ui.popup.seen = anchor, true
 	}
 	text_fit(ui, strip_name(app, row, ch), name_x, r.y + 12, bx - name_x - 6, FONT_SMALL, COL_DIM)
 
@@ -817,6 +823,23 @@ panel_output_settings :: proc(e: ^Ed) {
 		if open do rl.DrawRectangleRoundedLinesEx(r, 0.25, 4, 2, COL_ACCENT)
 		e.y += ED_ROW_H + 10
 	}
+
+	// control room: Main Out (stored in the interface) or pinned locally
+	ui := e.ui
+	text(ui, "Control room", e.x, e.y + 4, FONT, COL_DIM)
+	e.y += 22
+	half := (e.w - 5) / 2
+	is_main := main_out(ui.app) == e.ch
+	if button(ui, {e.x, e.y, half, ED_ROW_H}, is_main ? "Main Out" : "Make Main Out", is_main, COL_ACCENT, FONT_SMALL) && !is_main {
+		ui.main_pending, ui.confirm = e.ch, .Main_Out
+	}
+	if !is_main {
+		pinned := cr_pinned(ui, e.ch)
+		if button(ui, {e.x + half + 5, e.y, half, ED_ROW_H}, pinned ? "In control room" : "Pin to control room", pinned, COL_ACCENT, FONT_SMALL) {
+			cr_pin_toggle(ui, e.ch)
+		}
+	}
+	ed_next(e)
 }
 
 panel_eq :: proc(e: ^Ed, avail: f32) {
@@ -895,10 +918,6 @@ draw_fx_dock :: proc(ui: ^UI, area: rl.Rectangle) {
 
 	e.base = "/controlroom"
 	ed_section(&e, "Control Room")
-	half := (e.w - 5) / 2
-	toggle_param(ui, {e.x, e.y, half, ED_ROW_H}, "Dim", "/controlroom/dim", COL_ON, FONT)
-	toggle_param(ui, {e.x + half + 5, e.y, half, ED_ROW_H}, "Mono", "/controlroom/mainmono", COL_ON, FONT)
-	ed_next(&e)
 	if state_has(&ui.app.st, "/globalmute") {
 		toggle_param(ui, {e.x, e.y, e.w, ED_ROW_H}, "Mute enable (all mutes)", "/globalmute", COL_MUTE, FONT)
 		ed_next(&e)
@@ -949,4 +968,74 @@ draw_fx_dock :: proc(ui: ^UI, area: rl.Rectangle) {
 		ty := area.y + (area.height - th) * ui.fx_scroll / max_scroll
 		rl.DrawRectangleRounded({area.x + area.width - 7, ty, 4, th}, 1, 4, COL_BUTTON_HOT)
 	}
+}
+
+channel_ed :: proc(ui: ^UI, row: Row, ch: int) -> Ed {
+	return Ed {
+		ui     = ui,
+		row    = row,
+		ch     = ch,
+		stereo = ch % 2 == 0 && is_stereo(ui.app, row, ch),
+		base   = fmt.tprintf("/%s/%d", ROW_BUS[row], ch),
+	}
+}
+
+// --- preset list ------------------------------------------------------------------------
+
+POPUP_W :: 250
+
+// Preset list under a panel's "Presets" button, drawn above the mixer
+// (unclipped). Click a name to recall it (the list stays open for trying
+// others), × deletes, "Save current as…" names a new one. Closes on a click
+// elsewhere, Esc, or when its panel is no longer drawn.
+draw_preset_popup :: proc(ui: ^UI, sw, sh: f32) {
+	p := &ui.popup
+	if !p.open do return
+	if !p.seen {
+		p^ = {}
+		return
+	}
+	p.seen = false
+	list := presets_of(&ui.presets, p.kind)
+	ROW :: 28
+	max_rows := max(1, int((sh - TOPBAR_H - 100) / ROW))
+	shown := min(len(list), max_rows)
+	h := 8 + 22 + f32(max(shown, 1)) * ROW + 6 + ROW + 8
+	r := rl.Rectangle{p.anchor.x + p.anchor.width - POPUP_W, p.anchor.y + p.anchor.height + 4, POPUP_W, h}
+	r.x = clamp(r.x, 4, sw - POPUP_W - 4)
+	if r.y + r.height > sh - 4 do r.y = max(TOPBAR_H, sh - 4 - r.height)
+	p.rect = r
+	ui.in_popup = true
+	defer ui.in_popup = false
+
+	rl.DrawRectangleRounded(r, 0.04, 4, COL_STRIP)
+	rl.DrawRectangleRoundedLinesEx(r, 0.04, 4, 1, COL_ACCENT)
+	x, y, w := r.x + 8, r.y + 8, r.width - 16
+	text(ui, fmt.tprintf("%s presets (saved on this computer)", PANEL_TITLE[p.kind]), x + 2, y + 2, FONT_TINY, COL_DIM)
+	y += 22
+	if shown == 0 {
+		text(ui, "none saved yet", x + 2, y + 6, FONT, COL_DIM)
+		y += ROW
+	}
+	e := channel_ed(ui, p.row, p.ch)
+	for &pr, i in list[:shown] {
+		if button(ui, {x, y, w - 32, ROW - 4}, pr.name, false, COL_ACCENT, FONT) {
+			sent := preset_recall(p.kind, &pr, &e)
+			set_status(ui, fmt.tprintf("%s preset \"%s\" recalled (%d values sent)", PANEL_TITLE[p.kind], pr.name, sent))
+		}
+		if button(ui, {x + w - 28, y, 28, ROW - 4}, "×") {
+			ui.preset_target = {row = p.row, ch = p.ch, kind = p.kind, index = i}
+			ui.confirm = .Delete_Preset
+		}
+		y += ROW
+	}
+	y += 6
+	if button(ui, {x, y, w, ROW - 2}, "Save current as…", false, COL_ACCENT, FONT) {
+		ui.preset_target = {row = p.row, ch = p.ch, kind = p.kind}
+		strings.builder_reset(&ui.text)
+		ui.confirm = .Save_Preset
+		p^ = {}
+		return
+	}
+	if (rl.IsMouseButtonPressed(.LEFT) || rl.IsMouseButtonPressed(.RIGHT)) && !hovered(r) && !hovered(p.anchor) do p^ = {}
 }

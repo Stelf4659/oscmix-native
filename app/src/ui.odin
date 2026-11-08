@@ -7,6 +7,7 @@ package oscmix_native
 
 import "core:fmt"
 import "core:math"
+import "core:slice"
 import "core:strings"
 import rl "../raylib"
 
@@ -97,6 +98,9 @@ Confirm_Action :: enum {
 	None,
 	Jack_Restart,
 	Interface_Mode,
+	Main_Out,
+	Save_Preset,
+	Delete_Preset,
 }
 
 Reveal :: struct {
@@ -129,9 +133,18 @@ UI :: struct {
 	panels:       map[u32]Panel_Set,
 	panel_scroll: map[u64]f32,
 	reveal:       Reveal, // panel to scroll into view
-	// FX dock (control room, reverb, echo)
+	// control room column: outputs pinned there besides Main Out
+	pins:         [dynamic]int,
+	pins_uid:     string, // owned; device the pins belong to
+	// FX dock (control room settings, reverb, echo)
 	fx_dock:      bool,
 	fx_scroll:    f32,
+	// presets
+	presets:      Preset_File,
+	popup:        Popup, // preset list of one panel
+	in_popup:     bool, // drawing the popup (it is exempt from its own input block)
+	preset_target: Preset_Target, // save / delete dialog subject
+	text:         strings.Builder, // save dialog name field
 	// settings
 	show_settings: bool,
 	jack_cfg:      Jack_Settings, // pending edit
@@ -139,9 +152,27 @@ UI :: struct {
 	jack_now:      Jack_Live,
 	audio_mode:    string, // owned
 	iface_pending: int,
+	main_pending:  int, // output to become Main Out (confirm dialog)
 	confirm:       Confirm_Action,
 	status:        string, // owned
 	status_until:  f64,
+}
+
+Popup :: struct {
+	open:   bool,
+	row:    Row,
+	ch:     int,
+	kind:   Panel_Kind,
+	anchor: rl.Rectangle, // its "Presets" button, refreshed while the panel is drawn
+	rect:   rl.Rectangle, // last drawn area; blocks input underneath
+	seen:   bool, // anchor refreshed this frame
+}
+
+Preset_Target :: struct {
+	row:   Row,
+	ch:    int,
+	kind:  Panel_Kind,
+	index: int, // delete: preset index
 }
 
 widget_id :: proc(w: Widget, row: Row, idx: int) -> u64 {
@@ -218,6 +249,7 @@ top_layer :: proc(ui: ^UI) -> Layer {
 // Mouse is over r, r belongs to the topmost layer, and r is not clipped away.
 interactive :: proc(ui: ^UI, r: rl.Rectangle) -> bool {
 	if ui.layer != top_layer(ui) || !hovered(r) do return false
+	if ui.popup.open && !ui.in_popup && hovered(ui.popup.rect) do return false
 	return !ui.clipped || hovered(ui.clip)
 }
 
@@ -457,6 +489,16 @@ strip_channels :: proc(app: ^App, row: Row) -> [dynamic]int {
 	return out
 }
 
+// Strips of a row; outputs shown in the control room column are left out.
+row_channels :: proc(ui: ^UI, row: Row) -> []int {
+	chans := strip_channels(ui.app, row)
+	if row != .Output do return chans[:]
+	cr := cr_outputs(ui)
+	out := make([dynamic]int, 0, len(chans), context.temp_allocator)
+	for ch in chans do if !slice.contains(cr, ch) do append(&out, ch)
+	return out[:]
+}
+
 level_of :: proc(app: ^App, row: Row, i: int) -> (peak, rms: f32) {
 	if e, ok := app.st.vals[fmt.tprintf("/level/%s/%d", ROW_LEVEL[row], i)]; ok && e.n >= 2 {
 		return e.f[0], e.f[1]
@@ -488,7 +530,7 @@ draw_row :: proc(ui: ^UI, row: Row, area: rl.Rectangle) {
 	}
 	items := make([dynamic]Item, context.temp_allocator)
 	content_w: f32 = 0
-	for ch in strip_channels(app, row) {
+	for ch in row_channels(ui, row) {
 		append(&items, Item{x = content_w, w = STRIP_W, ch = ch})
 		content_w += STRIP_W
 		set := ui.panels[strip_key(row, ch)]
@@ -670,12 +712,8 @@ draw_topbar :: proc(ui: ^UI, w: f32) {
 	bx -= 6 + 56
 	if button(ui, {bx, 9, 56, 28}, "FX", ui.fx_dock) {
 		ui.fx_dock = !ui.fx_dock
-		prefs_save({scale = ui.scale, fx_dock = ui.fx_dock})
+		prefs_save(ui)
 	}
-	bx -= 16 + 64
-	toggle_param(ui, {bx, 9, 64, 28}, "MONO", "/controlroom/mainmono", COL_ON, FONT)
-	bx -= 6 + 56
-	toggle_param(ui, {bx, 9, 56, 28}, "DIM", "/controlroom/dim", COL_ON, FONT)
 
 	jack := ui.jack_saved
 	jtxt := jack.rate > 0 ? fmt.tprintf("JACK %d · %d×%d", jack.rate, jack.period, jack.nperiods) : "JACK: no jackd.env"
@@ -812,11 +850,19 @@ draw_confirm :: proc(ui: ^UI, sw, sh: f32) {
 	switch ui.confirm {
 	case .None:
 		return
+	case .Save_Preset:
+		draw_save_preset(ui, sw, sh)
+		return
 	case .Jack_Restart:
 		msg = fmt.tprintf("Restart jackd at %d Hz, %d×%d?\nAudio apps (REAPER) lose their JACK connection\nand must be restarted.", ui.jack_cfg.rate, ui.jack_cfg.period, ui.jack_cfg.nperiods)
 	case .Interface_Mode:
 		mode := INTERFACE_MODES[ui.iface_pending]
 		msg = mode == "CC" ? "Switch the interface to CC mode?\nThe unit restarts." : fmt.tprintf("Switch the interface to %s?\nThe unit restarts in driver mode: Linux has no driver for it,\nso audio and this app stop working. Switching back to CC\nneeds the front panel (SETUP > Options > Interface Mode).", mode)
+	case .Main_Out:
+		msg = fmt.tprintf("Make %s the Main Out?\nThe interface stores this; Dim, Mono and Recall then act\non it. The current Main Out goes back to the output row\nunless it is pinned to the control room.", strip_name(ui.app, .Output, ui.main_pending))
+	case .Delete_Preset:
+		t := ui.preset_target
+		msg = fmt.tprintf("Delete the %s preset \"%s\"?", PANEL_TITLE[t.kind], presets_of(&ui.presets, t.kind)[t.index].name)
 	}
 	r := rl.Rectangle{(sw - 580) / 2, (sh - 210) / 2, 580, 210}
 	rl.DrawRectangleRec({0, 0, sw, sh}, {0, 0, 0, 140})
@@ -827,7 +873,7 @@ draw_confirm :: proc(ui: ^UI, sw, sh: f32) {
 		action := ui.confirm
 		ui.confirm = .None
 		switch action {
-		case .None:
+		case .None, .Save_Preset:
 		case .Jack_Restart:
 			if !jack_env_write(ui.jack_cfg) {
 				set_status(ui, "could not write ~/.config/jackd/jackd.env")
@@ -840,7 +886,49 @@ draw_confirm :: proc(ui: ^UI, sw, sh: f32) {
 		case .Interface_Mode:
 			app_send(ui.app, "/hardware/interfacemode", f32(ui.iface_pending))
 			set_status(ui, fmt.tprintf("interface mode: %s", INTERFACE_MODES[ui.iface_pending]))
+		case .Main_Out:
+			app_send(ui.app, "/controlroom/mainout", f32(ui.main_pending))
+			set_status(ui, fmt.tprintf("Main Out: %s", strip_name(ui.app, .Output, ui.main_pending)))
+		case .Delete_Preset:
+			t := ui.preset_target
+			if !preset_delete(&ui.presets, t.kind, t.index) do set_status(ui, "could not save presets.json")
 		}
+	}
+}
+
+// Name entry for saving the subject panel's settings as a preset.
+draw_save_preset :: proc(ui: ^UI, sw, sh: f32) {
+	t := ui.preset_target
+	for c := rl.GetCharPressed(); c != 0; c = rl.GetCharPressed() {
+		if c >= 32 && c < 256 && c != 127 && strings.builder_len(ui.text) < 40 do strings.write_rune(&ui.text, c)
+	}
+	if rl.IsKeyPressed(.BACKSPACE) || rl.IsKeyPressedRepeat(.BACKSPACE) do strings.pop_rune(&ui.text)
+	name := strings.trim_space(strings.to_string(ui.text))
+
+	r := rl.Rectangle{(sw - 520) / 2, (sh - 200) / 2, 520, 200}
+	rl.DrawRectangleRec({0, 0, sw, sh}, {0, 0, 0, 140})
+	rl.DrawRectangleRounded(r, 0.05, 6, COL_ROW)
+	text(ui, fmt.tprintf("Save %s preset from %s", PANEL_TITLE[t.kind], strip_name(ui.app, t.row, t.ch)), r.x + 20, r.y + 18, FONT_HEAD)
+	field := rl.Rectangle{r.x + 20, r.y + 54, r.width - 40, 34}
+	rl.DrawRectangleRounded(field, 0.2, 4, COL_TRACK)
+	rl.DrawRectangleRoundedLinesEx(field, 0.2, 4, 1, COL_ACCENT)
+	typed := strings.to_string(ui.text)
+	text(ui, typed, field.x + 10, field.y + 9, FONT_NAME)
+	if int(rl.GetTime() * 2) % 2 == 0 {
+		cx := field.x + 11 + text_width(ui, typed, FONT_NAME)
+		rl.DrawLineEx({cx, field.y + 7}, {cx, field.y + field.height - 7}, 1.5, COL_TEXT)
+	}
+	hint := "Type a name; Enter saves, Esc cancels."
+	for p in presets_of(&ui.presets, t.kind) do if p.name == name do hint = "Replaces the existing preset with this name."
+	text(ui, hint, field.x, field.y + field.height + 8, FONT_SMALL, COL_DIM)
+
+	if button(ui, {r.x + r.width - 230, r.y + r.height - 48, 100, 32}, "Cancel") do ui.confirm = .None
+	save := button(ui, {r.x + r.width - 120, r.y + r.height - 48, 100, 32}, "Save", name != "") || rl.IsKeyPressed(.ENTER) || rl.IsKeyPressed(.KP_ENTER)
+	if save && name != "" {
+		e := channel_ed(ui, t.row, t.ch)
+		ok := preset_store(&ui.presets, t.kind, &e, name)
+		set_status(ui, ok ? fmt.tprintf("%s preset \"%s\" saved", PANEL_TITLE[t.kind], name) : "could not save presets.json")
+		ui.confirm = .None
 	}
 }
 
@@ -868,7 +956,7 @@ ui_set_scale :: proc(ui: ^UI, scale: f32) {
 	ui.scale = s
 	rl.SetMouseScale(1 / s, 1 / s)
 	load_ui_font(ui)
-	prefs_save({scale = s, fx_dock = ui.fx_dock})
+	prefs_save(ui)
 }
 
 // Initial scale when nothing is saved: by monitor height.
@@ -889,6 +977,8 @@ handle_keys :: proc(ui: ^UI) {
 			ui.confirm = .None
 		} else if ui.show_settings {
 			ui.show_settings = false
+		} else if ui.popup.open {
+			ui.popup.open = false
 		} else {
 			clear(&ui.panels) // close every channel panel
 		}
@@ -906,6 +996,10 @@ run_ui :: proc(app: ^App, port: string) {
 		delete(ui.status)
 		delete(ui.panels)
 		delete(ui.panel_scroll)
+		delete(ui.pins)
+		delete(ui.pins_uid)
+		presets_destroy(&ui.presets)
+		strings.builder_destroy(&ui.text)
 	}
 	app_connect(app, port)
 
@@ -922,10 +1016,12 @@ run_ui :: proc(app: ^App, port: string) {
 	prefs, has_prefs := prefs_load()
 	ui.fx_dock = prefs.fx_dock
 	ui_set_scale(&ui, has_prefs ? prefs.scale : default_scale())
+	presets_load(&ui.presets)
 	settings_refresh(&ui)
 
 	for !rl.WindowShouldClose() {
 		app_poll(app)
+		cr_sync_pins(&ui)
 		handle_keys(&ui)
 		ui.wheel_used = false
 		// stereo pairs: always address the left channel
@@ -933,7 +1029,9 @@ run_ui :: proc(app: ^App, port: string) {
 
 		lw := f32(rl.GetScreenWidth()) / ui.scale
 		lh := f32(rl.GetScreenHeight()) / ui.scale
-		mix_w := ui.fx_dock ? max(lw - FX_DOCK_W, 320) : lw
+		fx_w: f32 = ui.fx_dock ? FX_DOCK_W : 0
+		cr_w := cr_width(&ui)
+		mix_w := max(lw - fx_w - cr_w, 320)
 		rl.BeginDrawing()
 		rl.ClearBackground(COL_BG)
 		rl.BeginMode2D({zoom = ui.scale})
@@ -947,7 +1045,9 @@ run_ui :: proc(app: ^App, port: string) {
 			draw_row(&ui, row, {0, y + 2, mix_w, h - 4})
 			y += h
 		}
-		if ui.fx_dock do draw_fx_dock(&ui, {mix_w + 2, TOPBAR_H + 2, lw - mix_w - 2, rows_h - 4})
+		draw_control_room(&ui, {mix_w + 2, TOPBAR_H + 2, cr_w - 2, rows_h - 4})
+		if ui.fx_dock do draw_fx_dock(&ui, {mix_w + cr_w + 2, TOPBAR_H + 2, fx_w - 2, rows_h - 4})
+		draw_preset_popup(&ui, lw, lh)
 		ui.layer = .Settings
 		if ui.show_settings do draw_settings(&ui, lw, lh)
 		// the top bar stays usable while settings are open (its button closes them)
