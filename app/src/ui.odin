@@ -9,6 +9,7 @@ import "core:fmt"
 import "core:math"
 import "core:slice"
 import "core:strings"
+import "core:time"
 import rl "../raylib"
 
 // --- look ---------------------------------------------------------------
@@ -769,6 +770,20 @@ draw_topbar :: proc(ui: ^UI, w: f32) {
 	ix := bx - 16 - iw
 	text(ui, info, ix, 15, FONT, COL_DIM)
 
+	// DSP load reported by the interface (live; e.g. 9 idle, 23 with EQ +
+	// dynamics on 8 channels)
+	if app.connected && state_has(&app.st, "/hardware/dspload") {
+		load := state_get(&app.st, "/hardware/dspload")
+		dx := ix - 22 - 132
+		text(ui, "DSP", dx, 15, FONT, COL_DIM)
+		bar := rl.Rectangle{dx + 36, 18, 56, 10}
+		rl.DrawRectangleRounded(bar, 0.5, 4, COL_TRACK)
+		col := load >= 85 ? COL_RED : (load >= 60 ? COL_YELLOW : COL_GREEN)
+		rl.DrawRectangleRounded({bar.x, bar.y, bar.width * clamp(load / 100, 0, 1), bar.height}, 0.5, 4, col)
+		text(ui, fmt.tprintf("%d %%", int(load)), bar.x + bar.width + 8, 15, FONT, COL_TEXT)
+		ix = dx
+	}
+
 	if app.connected {
 		dev := state_str(&app.st, "/device/name")
 		if dev == "" do dev = app.device
@@ -1106,6 +1121,20 @@ handle_keys :: proc(ui: ^UI) {
 
 // --- main loop ---------------------------------------------------------------------
 
+// Frame rate: full while the user interacts or bulk writes are sent, half
+// otherwise (meters stay smooth at 30 fps).
+FPS_ACTIVE :: 60.0
+FPS_IDLE :: 30.0
+ACTIVE_SECONDS :: 0.5
+
+user_active :: proc(ui: ^UI) -> bool {
+	if d := rl.GetMouseDelta(); d.x != 0 || d.y != 0 do return true
+	if rl.GetMouseWheelMove() != 0 || rl.IsMouseButtonDown(.LEFT) || rl.IsMouseButtonDown(.RIGHT) do return true
+	if ui.active != 0 || ui.confirm != .None do return true
+	_, pending := app_queue_progress(ui.app)
+	return pending > 0
+}
+
 run_ui :: proc(app: ^App, port: string) {
 	ui := UI{app = app, iface_pending = -1, snap_active = -1}
 	defer {
@@ -1127,7 +1156,7 @@ run_ui :: proc(app: ^App, port: string) {
 	rl.InitWindow(1500, 940, "oscmix")
 	defer rl.CloseWindow()
 	rl.SetWindowMinSize(800, 560)
-	rl.SetTargetFPS(60)
+	rl.SetTargetFPS(0) // paced in the loop below
 	rl.SetExitKey(.KEY_NULL) // Esc closes panels instead
 	if ok, path := run_cmd("fc-match", "-f", "%{file}", "sans-serif:style=Regular"); ok && path != "" {
 		ui.font_path = strings.clone(path)
@@ -1138,7 +1167,10 @@ run_ui :: proc(app: ^App, port: string) {
 	presets_load(&ui.presets)
 	settings_refresh(&ui)
 
+	last_input: f64
 	for !rl.WindowShouldClose() {
+		frame_start := time.tick_now()
+		if user_active(&ui) do last_input = rl.GetTime()
 		app_poll(app)
 		cr_sync_pins(&ui)
 		handle_keys(&ui)
@@ -1177,5 +1209,10 @@ run_ui :: proc(app: ^App, port: string) {
 		rl.EndMode2D()
 		rl.EndDrawing()
 		free_all(context.temp_allocator)
+		// pace by sleeping (raylib's limiter busy-waits part of every frame)
+		budget := 1.0 / (rl.GetTime() - last_input < ACTIVE_SECONDS ? FPS_ACTIVE : FPS_IDLE)
+		if el := time.duration_seconds(time.tick_since(frame_start)); el < budget {
+			time.sleep(time.Duration((budget - el) * f64(time.Second)))
+		}
 	}
 }
