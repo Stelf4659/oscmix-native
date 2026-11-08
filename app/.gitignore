@@ -1,0 +1,4 @@
+oscmix-native
+engine/*.o
+engine/libengine.a
+third_party/
