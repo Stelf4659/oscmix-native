@@ -54,6 +54,10 @@ main :: proc() {
 		app_shutdown(&app)
 		os.exit(code)
 	}
+	if !instance_lock() {
+		fmt.eprintln("oscmix-native is already running")
+		os.exit(1)
+	}
 	run_ui(&app, port)
 	app_shutdown(&app)
 }

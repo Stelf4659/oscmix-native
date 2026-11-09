@@ -8,6 +8,7 @@ import "core:fmt"
 import "core:os"
 import "core:strconv"
 import "core:strings"
+import "core:sys/linux"
 
 foreign import libjack "system:jack"
 
@@ -133,4 +134,16 @@ audio_mode_get :: proc() -> string {
 
 audio_mode_set :: proc(mode: string) -> (ok: bool, output: string) {
 	return run_cmd(audio_mode_script(), mode)
+}
+
+// Takes the per-user UI lock. False means another window already holds it:
+// two instances would each keep their own mixer state and both write to the
+// interface. The descriptor stays open for the life of the process; the
+// kernel drops the lock on exit, however the process ends.
+instance_lock :: proc() -> bool {
+	dir := os.get_env("XDG_RUNTIME_DIR", context.temp_allocator)
+	path := dir != "" ? fmt.ctprintf("%s/oscmix-native.lock", dir) : fmt.ctprintf("/tmp/oscmix-native-%d.lock", linux.getuid())
+	fd, err := linux.open(path, {.RDWR, .CREAT, .CLOEXEC}, {.IRUSR, .IWUSR})
+	if err != .NONE do return true // no lock file possible: do not block the UI over it
+	return linux.flock(fd, {.EX, .NB}) != .EWOULDBLOCK
 }
