@@ -276,7 +276,7 @@ midi_reader :: proc(data: rawptr) {
 
 // Delivers every SysEx message received since the last call (main thread);
 // returns how many there were.
-midi_poll :: proc(m: ^Midi, on_sysex: proc(msg: []u8)) -> (count: int) {
+midi_poll :: proc(m: ^Midi, on_sysex: proc(msg: []u8, user: rawptr), user: rawptr) -> (count: int) {
 	sync.mutex_lock(&m.lock)
 	m.inbox, m.drain = m.drain, m.inbox
 	sync.mutex_unlock(&m.lock)
@@ -284,7 +284,7 @@ midi_poll :: proc(m: ^Midi, on_sysex: proc(msg: []u8)) -> (count: int) {
 		n: u32
 		copy(([^]u8)(&n)[:4], m.drain[i:i + 4])
 		i += 4
-		on_sysex(m.drain[i:i + int(n)])
+		on_sysex(m.drain[i:i + int(n)], user)
 		i += int(n)
 		count += 1
 	}

@@ -166,6 +166,11 @@ UI :: struct {
 	confirm:       Confirm_Action,
 	status:        string, // owned
 	status_until:  f64,
+	// tooltip: offered by a hovered widget each frame, drawn last
+	tip:           string,
+	tip_id:        u64,
+	tip_since:     f64,
+	tip_seen:      bool,
 }
 
 Popup :: struct {
@@ -234,6 +239,43 @@ text_fit :: proc(ui: ^UI, s: string, x, y, max_w: f32, size: f32 = FONT, color :
 }
 
 hovered :: proc(r: rl.Rectangle) -> bool {return rl.CheckCollisionPointRec(rl.GetMousePosition(), r)}
+
+shift_down :: proc() -> bool {return rl.IsKeyDown(.LEFT_SHIFT) || rl.IsKeyDown(.RIGHT_SHIFT)}
+ctrl_down :: proc() -> bool {return rl.IsKeyDown(.LEFT_CONTROL) || rl.IsKeyDown(.RIGHT_CONTROL)}
+
+// Wheel for value widgets: only with Shift held, so scrolling never changes a
+// level. Some systems turn Shift+wheel into a horizontal wheel; either counts.
+value_wheel :: proc() -> f32 {
+	if !shift_down() do return 0
+	w := rl.GetMouseWheelMoveV()
+	return w.y != 0 ? w.y : w.x
+}
+
+TIP_DELAY :: 0.6 // seconds of hovering before a tooltip shows
+
+// Offers a tooltip for widget id this frame (shown by draw_tip after TIP_DELAY).
+set_tip :: proc(ui: ^UI, id: u64, msg: string) {
+	if ui.tip_id != id do ui.tip_id, ui.tip_since = id, rl.GetTime()
+	ui.tip, ui.tip_seen = msg, true
+}
+
+draw_tip :: proc(ui: ^UI, sw, sh: f32) {
+	defer ui.tip_seen = false
+	if !ui.tip_seen {
+		ui.tip_id = 0
+		return
+	}
+	if ui.active != 0 || rl.GetTime() - ui.tip_since < TIP_DELAY do return
+	lines := strings.split_lines(ui.tip, context.temp_allocator)
+	w: f32 = 0
+	for l in lines do w = max(w, text_width(ui, l, FONT_SMALL))
+	h := f32(len(lines)) * (FONT_SMALL + 3) + 8
+	m := rl.GetMousePosition()
+	r := rl.Rectangle{min(m.x + 14, sw - w - 18), min(m.y + 18, sh - h - 4), w + 14, h}
+	rl.DrawRectangleRounded(r, 0.2, 4, COL_TRACK)
+	rl.DrawRectangleRoundedLinesEx(r, 0.2, 4, 1, COL_DIM)
+	for l, i in lines do text(ui, l, r.x + 7, r.y + 4 + f32(i) * (FONT_SMALL + 3), FONT_SMALL, COL_TEXT)
+}
 
 // True on the second press within 350 ms on the same widget.
 double_click :: proc(ui: ^UI, id: u64) -> bool {
@@ -381,13 +423,14 @@ fmt_db :: proc(db: f32) -> string {
 	return fmt.tprintf("%+.1f", db)
 }
 
-// Vertical fader. Drag (Shift = fine), wheel ±0.5 dB (Shift ±0.1),
-// double-click = 0 dB, right-click = off/minimum.
+// Vertical fader. Drag (Shift = fine), Shift+wheel ±0.5 dB (Ctrl+Shift ±0.1),
+// double-click = 0 dB, right-click = off/minimum. The plain wheel scrolls.
 fader :: proc(ui: ^UI, id: u64, r: rl.Rectangle, db: f32, off: f32, known := true) -> (out: f32, changed: bool) {
 	out = db
 	mouse := rl.GetMousePosition()
 	travel := r.height - 16
 	if interactive(ui, r) {
+		set_tip(ui, id, "Drag (Shift: fine) · Shift+wheel ±0.5 dB, Ctrl+Shift+wheel ±0.1\nDouble-click 0 dB · right-click off")
 		if rl.IsMouseButtonPressed(.LEFT) {
 			if double_click(ui, id) {
 				out = 0
@@ -396,8 +439,8 @@ fader :: proc(ui: ^UI, id: u64, r: rl.Rectangle, db: f32, off: f32, known := tru
 			}
 		} else if rl.IsMouseButtonPressed(.RIGHT) {
 			out = off
-		} else if wheel := rl.GetMouseWheelMove(); wheel != 0 && !rl.IsKeyDown(.LEFT_CONTROL) {
-			step: f32 = rl.IsKeyDown(.LEFT_SHIFT) ? 0.1 : 0.5
+		} else if wheel := value_wheel(); wheel != 0 {
+			step: f32 = ctrl_down() ? 0.1 : 0.5
 			base := db <= FADER_MIN_DB ? FADER_MIN_DB : db
 			out = clamp(base + wheel * step, FADER_MIN_DB, FADER_MAX_DB)
 			if out <= FADER_MIN_DB do out = off
@@ -405,7 +448,7 @@ fader :: proc(ui: ^UI, id: u64, r: rl.Rectangle, db: f32, off: f32, known := tru
 	}
 	if ui.active == id {
 		if rl.IsMouseButtonDown(.LEFT) {
-			scale: f32 = rl.IsKeyDown(.LEFT_SHIFT) ? 0.15 : 1
+			scale: f32 = shift_down() ? 0.15 : 1
 			p := clamp(ui.drag_value - (mouse.y - ui.drag_origin.y) / travel * scale, 0, 1)
 			out = pos_to_db(p, off)
 		} else {
@@ -559,11 +602,12 @@ draw_row :: proc(ui: ^UI, row: Row, area: rl.Rectangle) {
 	view := rl.Rectangle{area.x + HEADER_W, area.y, area.width - HEADER_W, area.height - SCROLLBAR_H}
 	max_scroll := max(0, content_w - view.width)
 
-	// horizontal scrolling: horizontal wheel, Ctrl+wheel, or the scrollbar
-	if interactive(ui, area) {
+	// horizontal scrolling: the wheel (vertical or horizontal) or the scrollbar.
+	// Value widgets take the wheel only with Shift, and an open panel that can
+	// scroll takes it first (it sets wheel_used), so this runs after drawing.
+	defer if interactive(ui, area) && !ui.wheel_used && !shift_down() {
 		wv := rl.GetMouseWheelMoveV()
-		dx := rl.IsKeyDown(.LEFT_CONTROL) ? wv.y : wv.x
-		ui.scroll[row] -= dx * STRIP_W * 2
+		ui.scroll[row] -= (wv.x != 0 ? wv.x : wv.y) * STRIP_W * 2
 	}
 	// a panel that was just opened scrolls fully into view (once it is laid out)
 	if ui.reveal.pending && ui.reveal.row == row {
@@ -1244,6 +1288,7 @@ run_ui :: proc(app: ^App, port: string) {
 		draw_topbar(&ui, lw)
 		ui.layer = .Confirm
 		draw_confirm(&ui, lw, lh)
+		draw_tip(&ui, lw, lh)
 		rl.EndMode2D()
 		rl.EndDrawing()
 		free_all(context.temp_allocator)

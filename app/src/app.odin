@@ -56,7 +56,8 @@ engine_osc_out :: proc "c" (user: rawptr, buf: [^]u8, len: u32) {
 }
 
 @(private = "file")
-on_sysex :: proc(msg: []u8) {
+on_sysex :: proc(msg: []u8, user: rawptr) {
+	session_sysex((^App)(user), msg)
 	engine_sysex(raw_data(msg), u32(len(msg)))
 }
 
@@ -85,6 +86,8 @@ app_connect :: proc(app: ^App, port: string = "") -> bool {
 	app.connected = true
 	app.last_tick = time.tick_now()
 	app.last_save, app.last_rx, app.last_check = app.last_tick, app.last_tick, app.last_tick
+	// input sends are re-read from the refresh dump (it lists those that are on)
+	state_forget_prefix(&app.st, "/mix/in/")
 	session_connected(app)
 	app_send(app, "/device/info")
 	app_send(app, "/refresh")
@@ -165,7 +168,7 @@ app_poll :: proc(app: ^App, levels := true, reconnect := true) {
 		}
 		return
 	}
-	if midi_poll(&app.midi, on_sysex) > 0 do app.last_rx = now
+	if midi_poll(&app.midi, on_sysex, app) > 0 do app.last_rx = now
 	if time.duration_seconds(time.tick_diff(app.last_check, now)) >= WATCH_SECONDS {
 		app.last_check = now
 		if !midi_port_present(&app.midi) {

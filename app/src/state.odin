@@ -90,8 +90,9 @@ state_set_mix_path :: proc(st: ^State, device_uid: string) {
 	st.mix_path = fmt.aprintf("%s/oscmix-native/mix-%s.json", dir, safe)
 }
 
-// Loads saved mix values for display. Never sent to the device; values the
-// engine has already reported win.
+// Loads saved playback sends for display. Never sent to the device; values
+// the engine has already reported win. Input sends are not loaded: the unit
+// reports every input send that is on in its refresh dump (session.odin).
 state_load_mix :: proc(st: ^State) -> int {
 	if st.mix_path == "" do return 0
 	data, err := os.read_entire_file(st.mix_path, context.temp_allocator)
@@ -100,7 +101,7 @@ state_load_mix :: proc(st: ^State) -> int {
 	if json.unmarshal(data, &saved, allocator = context.temp_allocator) != nil do return 0
 	n := 0
 	for addr, vals in saved {
-		if !strings.has_prefix(addr, "/mix/") || state_has(st, addr) do continue
+		if !strings.has_prefix(addr, "/mix/pb/") || state_has(st, addr) do continue
 		msg := Osc_Msg{addr = addr}
 		for v in vals[:min(len(vals), MAX_OSC_ARGS)] {
 			msg.args[msg.argc] = v
@@ -111,6 +112,17 @@ state_load_mix :: proc(st: ^State) -> int {
 	}
 	st.mix_dirty = false
 	return n
+}
+
+// Drops every value whose address starts with prefix.
+state_forget_prefix :: proc(st: ^State, prefix: string) {
+	doomed := make([dynamic]string, context.temp_allocator)
+	for k in st.vals do if strings.has_prefix(k, prefix) do append(&doomed, k)
+	for k in doomed {
+		key, e := delete_key(&st.vals, k)
+		delete(e.s)
+		delete(key)
+	}
 }
 
 state_save_mix :: proc(st: ^State) {

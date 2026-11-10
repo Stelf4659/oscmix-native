@@ -117,27 +117,29 @@ fmt_value :: proc(s: Slider, v: f32) -> string {
 	return fmt.tprintf("%s %s", num, s.unit)
 }
 
-// Horizontal value slider. Drag (Shift = fine), wheel = one step (Shift: finer
-// for frequencies), double-click = default.
+// Horizontal value slider. Drag (Shift = fine), Shift+wheel = one step
+// (Ctrl+Shift: finer), double-click = default. The plain wheel scrolls.
 slider :: proc(ui: ^UI, id: u64, r: rl.Rectangle, s: Slider, v: f32, size: f32 = FONT_SMALL) -> (out: f32, changed: bool) {
 	out = v
 	mouse := rl.GetMousePosition()
 	shift := rl.IsKeyDown(.LEFT_SHIFT) || rl.IsKeyDown(.RIGHT_SHIFT)
 	if interactive(ui, r) {
+		set_tip(ui, id, "Drag (Shift: fine) · Shift+wheel one step (Ctrl+Shift: finer)\nDouble-click default")
 		if rl.IsMouseButtonPressed(.LEFT) {
 			if double_click(ui, id) {
 				out = s.def
 			} else {
 				ui.active, ui.drag_origin, ui.drag_value = id, mouse, slider_pos(s, v)
 			}
-		} else if wheel := rl.GetMouseWheelMove(); wheel != 0 && !rl.IsKeyDown(.LEFT_CONTROL) {
+		} else if wheel := value_wheel(); wheel != 0 {
 			ui.wheel_used = true
+			fine := ctrl_down()
 			if s.log {
-				out = slider_quantize(s, v * math.pow(shift ? f32(1.005) : f32(1.04), wheel))
+				out = slider_quantize(s, v * math.pow(fine ? f32(1.005) : f32(1.04), wheel))
 				if out == v do out = slider_quantize(s, v + math.sign(wheel) * s.step)
 			} else {
 				step := s.step
-				if !shift && (s.max - s.min) / step > 150 do step *= 5
+				if !fine && (s.max - s.min) / step > 150 do step *= 5
 				out = slider_quantize(s, v + wheel * step)
 			}
 		}
@@ -391,7 +393,7 @@ graph_y :: proc(r: rl.Rectangle, db: f64) -> f32 {
 	return r.y + r.height / 2 - f32(clamp(db, -GRAPH_DB, GRAPH_DB) / GRAPH_DB) * (r.height / 2 - 4)
 }
 
-// Draggable graph node: drag moves it, wheel / double-click are reported.
+// Draggable graph node: drag moves it, Shift+wheel / double-click are reported.
 Node_Input :: struct {
 	dragging: bool,
 	delta:    rl.Vector2, // mouse movement since the press
@@ -405,13 +407,14 @@ graph_node :: proc(ui: ^UI, id: u64, c: rl.Vector2, start: [2]f32, label: string
 	mouse := rl.GetMousePosition()
 	hot := interactive(ui, hit)
 	if hot {
+		set_tip(ui, id, "Drag to move · Shift+wheel: Q (EQ) or ratio (dynamics)\nDouble-click: 0 dB (EQ)")
 		if rl.IsMouseButtonPressed(.LEFT) {
 			if double_click(ui, id) {
 				in_.double = true
 			} else {
 				ui.active, ui.drag_origin, ui.drag_value, ui.drag_value2 = id, mouse, start[0], start[1]
 			}
-		} else if w := rl.GetMouseWheelMove(); w != 0 && !rl.IsKeyDown(.LEFT_CONTROL) {
+		} else if w := value_wheel(); w != 0 {
 			ui.wheel_used = true
 			in_.wheel = w
 		}
@@ -432,7 +435,7 @@ graph_node :: proc(ui: ^UI, id: u64, c: rl.Vector2, start: [2]f32, label: string
 }
 
 // Frequency response with draggable band nodes: drag = frequency (+ gain for
-// bell/shelf), wheel = Q, double-click = 0 dB. The low cut node ("L") moves
+// bell/shelf), Shift+wheel = Q, double-click = 0 dB. The low cut node ("L") moves
 // its frequency.
 eq_graph :: proc(e: ^Ed, r: rl.Rectangle, family: string, nbands: int, with_lowcut: bool) {
 	ui := e.ui
@@ -555,7 +558,7 @@ channel_level :: proc(e: ^Ed) -> f32 {
 }
 
 // Transfer curve with draggable C (compressor) and E (expander/gate) nodes:
-// drag sideways = threshold, up/down = ratio, wheel = ratio. When dynamics
+// drag sideways = threshold, up/down = ratio, Shift+wheel = ratio. When dynamics
 // are on, the live input level rides the curve and the estimated gain change
 // is returned (static curve; attack/release are not modelled).
 dyn_graph :: proc(e: ^Ed, r: rl.Rectangle) -> (gr: f32, live: bool) {
@@ -761,8 +764,11 @@ draw_panel :: proc(ui: ^UI, row: Row, ch: int, kind: Panel_Kind, r: rl.Rectangle
 	clip_pop(ui, prev)
 
 	max_scroll := max(0, content_h - content.height)
-	if interactive(ui, content) && !ui.wheel_used && !rl.IsKeyDown(.LEFT_CONTROL) {
-		scroll -= rl.GetMouseWheelMove() * 50
+	if interactive(ui, content) && !ui.wheel_used && max_scroll > 0 {
+		if w := rl.GetMouseWheelMove(); w != 0 {
+			scroll -= w * 50
+			ui.wheel_used = true // the row behind does not scroll as well
+		}
 	}
 	scroll = clamp(scroll, 0, max_scroll)
 	if scroll == 0 {
