@@ -1,9 +1,10 @@
 package oscmix_native
 
 // Local per-interface data, ~/.config/oscmix-native/device-<uid>.json:
-// channel names, fader/mute groups and mixer snapshots. The UFX III keeps
-// none of these over this engine (written names are not stored; tested), so
-// like TotalMix's workspace they live on the computer.
+// channel names, fader/mute groups, mixer snapshots and the last session
+// (see session.odin). The UFX III keeps none of these over this engine
+// (written names are not stored; tested), so like TotalMix's workspace they
+// live on the computer.
 
 import "core:encoding/json"
 import "core:fmt"
@@ -26,6 +27,7 @@ Device_Data :: struct {
 	names:     map[string]string, // "/input/6" → name
 	groups:    map[string]u8, // "/input/6" → bits 0-3: fader groups 1-4, bits 4-7: mute groups 1-4
 	snapshots: [dynamic]Snapshot, // SNAPSHOT_SLOTS entries
+	session:   Snapshot, // mixer as last seen; name "" = none saved yet
 }
 
 @(private = "file")
@@ -33,6 +35,7 @@ Device_File :: struct {
 	names:     map[string]string,
 	groups:    map[string]u8,
 	snapshots: [dynamic]Snapshot,
+	session:   Snapshot,
 }
 
 chan_key :: proc(row: Row, ch: int) -> string {return fmt.tprintf("/%s/%d", ROW_BUS[row], ch)}
@@ -57,7 +60,7 @@ devdata_load :: proc(app: ^App, uid: string) {
 		if data, rerr := os.read_entire_file(app.dev.path, context.temp_allocator); rerr == nil {
 			f: Device_File
 			if json.unmarshal(data, &f) == nil {
-				app.dev.names, app.dev.groups, app.dev.snapshots = f.names, f.groups, f.snapshots
+				app.dev.names, app.dev.groups, app.dev.snapshots, app.dev.session = f.names, f.groups, f.snapshots, f.session
 			} else {
 				fmt.eprintfln("ignoring unreadable %s", app.dev.path)
 				delete(app.dev.path)
@@ -68,7 +71,6 @@ devdata_load :: proc(app: ^App, uid: string) {
 	for len(app.dev.snapshots) < SNAPSHOT_SLOTS do append(&app.dev.snapshots, Snapshot{})
 }
 
-@(private = "file")
 snapshot_free :: proc(s: ^Snapshot) {
 	delete(s.name)
 	for k in s.values do delete(k)
@@ -87,12 +89,13 @@ devdata_destroy :: proc(d: ^Device_Data) {
 	delete(d.groups)
 	for &s in d.snapshots do snapshot_free(&s)
 	delete(d.snapshots)
+	snapshot_free(&d.session)
 }
 
 devdata_save :: proc(app: ^App) -> bool {
 	d := &app.dev
 	if d.path == "" do return false
-	data, merr := json.marshal(Device_File{d.names, d.groups, d.snapshots}, {pretty = true}, context.temp_allocator)
+	data, merr := json.marshal(Device_File{d.names, d.groups, d.snapshots, d.session}, {pretty = true}, context.temp_allocator)
 	if merr != nil do return false
 	os.make_directory_all(filepath.dir(d.path))
 	tmp := strings.concatenate({d.path, ".tmp"}, context.temp_allocator)
@@ -176,7 +179,6 @@ group_mute_set :: proc(app: ^App, row: Row, ch: int, v: f32) {
 // Mixer settings a snapshot covers, per channel (hardware settings such as
 // preamp gain, 48V, reference level, stereo pairing, room EQ and names are
 // left alone, as in TotalMix).
-@(private = "file")
 snapshot_channel_params :: proc(row: Row) -> []string {
 	out := make([dynamic]string, context.temp_allocator)
 	switch row {
@@ -195,7 +197,6 @@ snapshot_channel_params :: proc(row: Row) -> []string {
 }
 
 // All send addresses of the current strip layout (left channels of pairs).
-@(private = "file")
 for_each_send :: proc(app: ^App, fn: proc(app: ^App, fader, pan: string, user: rawptr), user: rawptr) {
 	outs := strip_channels(app, .Output)
 	for row in ([]Row{.Input, .Playback}) {
@@ -264,12 +265,16 @@ snapshot_capture :: proc(app: ^App, unknown_off: bool) -> (values: map[string]f3
 }
 
 snapshot_store :: proc(app: ^App, slot: int, name: string, values: map[string]f32, all_sends: bool) -> bool {
-	s := &app.dev.snapshots[slot]
+	snapshot_set(&app.dev.snapshots[slot], name, values, all_sends)
+	return devdata_save(app)
+}
+
+// Replaces s with copies of name and values.
+snapshot_set :: proc(s: ^Snapshot, name: string, values: map[string]f32, all_sends: bool) {
 	snapshot_free(s)
 	s.name = strings.clone(name)
 	s.all_sends = all_sends
 	for k, v in values do s.values[strings.clone(k)] = v
-	return devdata_save(app)
 }
 
 snapshot_clear :: proc(app: ^App, slot: int) -> bool {
@@ -277,7 +282,6 @@ snapshot_clear :: proc(app: ^App, slot: int) -> bool {
 	return devdata_save(app)
 }
 
-@(private = "file")
 queue_if_needed :: proc(app: ^App, addr: string, v: f32) {
 	if state_has(&app.st, addr) && state_get(&app.st, addr) == v do return
 	app_queue(app, addr, v)

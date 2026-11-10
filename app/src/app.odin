@@ -21,6 +21,7 @@ App :: struct {
 	queue:      [dynamic]Queued_Write, // paced bulk writes
 	queue_pos:  int, // next to send
 	dev:        Device_Data, // local per-device data (names, groups, snapshots)
+	session:    Session, // last-session tracking and restore (session.odin)
 }
 
 Queued_Write :: struct {
@@ -84,6 +85,7 @@ app_connect :: proc(app: ^App, port: string = "") -> bool {
 	app.connected = true
 	app.last_tick = time.tick_now()
 	app.last_save, app.last_rx, app.last_check = app.last_tick, app.last_tick, app.last_tick
+	session_connected(app)
 	app_send(app, "/device/info")
 	app_send(app, "/refresh")
 	return true
@@ -105,6 +107,7 @@ app_disconnect :: proc(app: ^App, reason: string) {
 
 app_shutdown :: proc(app: ^App) {
 	if app.connected {
+		session_save(app)
 		state_save_mix(&app.st)
 		engine_close()
 		midi_close(&app.midi)
@@ -196,6 +199,7 @@ app_poll :: proc(app: ^App, levels := true, reconnect := true) {
 		n += 1
 	}
 	if app.queue_pos > 0 && app.queue_pos == len(app.queue) do app_queue_clear(app)
+	session_poll(app, now)
 	if app.st.mix_dirty && time.duration_seconds(time.tick_diff(app.last_save, now)) >= 2 {
 		app.last_save = now
 		state_save_mix(&app.st)

@@ -8,6 +8,7 @@ import "core:fmt"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
+import "core:time"
 
 Entry :: struct {
 	f: [MAX_OSC_ARGS]f32, // numeric args (ints and bools converted)
@@ -16,9 +17,10 @@ Entry :: struct {
 }
 
 State :: struct {
-	vals:       map[string]Entry, // keys owned
-	mix_dirty:  bool,
-	mix_path:   string, // where /mix values are saved; "" = no persistence
+	vals:        map[string]Entry, // keys owned
+	mix_dirty:   bool,
+	mix_path:    string, // where /mix values are saved; "" = no persistence
+	last_insert: time.Tick, // last time a new address appeared (refresh still arriving)
 }
 
 state_destroy :: proc(st: ^State) {
@@ -50,6 +52,7 @@ state_apply :: proc(st: ^State, msg: ^Osc_Msg) {
 	owned := ""
 	if just_inserted {
 		key^ = strings.clone(msg.addr)
+		st.last_insert = time.tick_now()
 	} else if e.s != "" && e.s == slot.s {
 		owned = slot.s // unchanged string: keep the existing copy
 	} else {

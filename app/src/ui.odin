@@ -105,6 +105,7 @@ Confirm_Action :: enum {
 	Delete_Preset,
 	Save_Snapshot,
 	Rename,
+	Reset_Mixer,
 }
 
 Reveal :: struct {
@@ -153,6 +154,7 @@ UI :: struct {
 	snap_active:  int, // last stored/recalled snapshot slot, -1 none
 	snap_unknown: int, // unknown sends when the store dialog opened
 	snap_unknown_off: bool, // store dialog choice: unknown sends stored as off
+	reset_channels: bool, // reset dialog: also reset channel settings
 	// settings
 	show_settings: bool,
 	jack_cfg:      Jack_Settings, // pending edit
@@ -821,7 +823,7 @@ INTERFACE_MODES := [?]string{"Auto", "USB2", "USB3", "CC"}
 
 draw_settings :: proc(ui: ^UI, sw, sh: f32) {
 	app := ui.app
-	r := rl.Rectangle{(sw - 640) / 2, TOPBAR_H + 20, 640, 520}
+	r := rl.Rectangle{(sw - 640) / 2, TOPBAR_H + 20, 640, 610}
 	rl.DrawRectangleRec({0, 0, sw, sh}, {0, 0, 0, 120})
 	rl.DrawRectangleRounded(r, 0.03, 6, COL_STRIP)
 	x, y := r.x + 20, r.y + 18
@@ -910,6 +912,20 @@ draw_settings :: proc(ui: ^UI, sw, sh: f32) {
 		}
 	}
 
+	y += 50
+	text(ui, "Mixer", x, y, FONT_HEAD)
+	text(ui, "the interface does not report its sends", x + 220, y + 2, FONT, COL_DIM)
+	y += 30
+	restore := app.session.restore
+	if button(ui, {x, y, 300, 28}, restore ? "Restore last session on connect: on" : "Restore last session on connect: off", restore) {
+		app.session.restore = !restore
+		prefs_save(ui)
+	}
+	if button(ui, {x + 310, y, 150, 28}, "Reset mixer…") && app.connected {
+		ui.reset_channels = false
+		ui.confirm = .Reset_Mixer
+	}
+
 	if button(ui, {r.x + r.width - 110, r.y + r.height - 44, 90, 30}, "Close") do ui.show_settings = false
 }
 
@@ -931,17 +947,34 @@ draw_confirm :: proc(ui: ^UI, sw, sh: f32) {
 	case .Delete_Preset:
 		t := ui.preset_target
 		msg = fmt.tprintf("Delete the %s preset \"%s\"?", PANEL_TITLE[t.kind], presets_of(&ui.presets, t.kind)[t.index].name)
+	case .Reset_Mixer:
+		msg = fmt.tprintf("Reset the mix? Every send goes off except playback 1/2 to\nMain Out (0 dB). Outputs go to 0 dB, Main Out and phones to\n%.0f dB. Snapshots and the last session are kept until you change\nsomething; the reset becomes the new last session.", RESET_QUIET_DB)
 	}
-	r := rl.Rectangle{(sw - 580) / 2, (sh - 210) / 2, 580, 210}
+	dh: f32 = ui.confirm == .Reset_Mixer ? 290 : 210
+	r := rl.Rectangle{(sw - 580) / 2, (sh - dh) / 2, 580, dh}
 	rl.DrawRectangleRec({0, 0, sw, sh}, {0, 0, 0, 140})
 	rl.DrawRectangleRounded(r, 0.05, 6, COL_ROW)
 	text(ui, msg, r.x + 20, r.y + 20, FONT_NAME)
+	if ui.confirm == .Reset_Mixer {
+		cy := r.y + r.height - 100
+		if button(ui, {r.x + 20, cy, 28, 28}, ui.reset_channels ? "×" : "", ui.reset_channels) do ui.reset_channels = !ui.reset_channels
+		text(ui, "Also reset channel settings: EQ, low cut, dynamics, auto level\n(off, default values), mute, pan, width, M/S, phase, FX send/return", r.x + 58, cy, FONT_SMALL, COL_DIM)
+	}
 	if button(ui, {r.x + r.width - 230, r.y + r.height - 48, 100, 32}, "Cancel") do ui.confirm = .None
 	if button(ui, {r.x + r.width - 120, r.y + r.height - 48, 100, 32}, "Confirm", true) {
 		action := ui.confirm
 		ui.confirm = .None
 		switch action {
 		case .None, .Save_Preset, .Save_Snapshot, .Rename:
+		case .Reset_Mixer:
+			quiet := make([dynamic]int, context.temp_allocator)
+			append(&quiet, ..cr_outputs(ui))
+			for ch in strip_channels(ui.app, .Output) {
+				if strings.has_prefix(interface_name(ui.app, .Output, ch), "PH") && !slice.contains(quiet[:], ch) do append(&quiet, ch)
+			}
+			n := mixer_reset(ui.app, quiet[:], ui.reset_channels)
+			ui.snap_active = -1
+			set_status(ui, fmt.tprintf("mixer reset: %d writes", n))
 		case .Jack_Restart:
 			if !jack_env_write(ui.jack_cfg) {
 				set_status(ui, "could not write ~/.config/jackd/jackd.env")
@@ -1149,6 +1182,8 @@ run_ui :: proc(app: ^App, port: string) {
 		presets_destroy(&ui.presets)
 		strings.builder_destroy(&ui.text)
 	}
+	prefs, has_prefs := prefs_load()
+	app.session.track, app.session.restore, app.session.restored = true, !prefs.no_restore, -1
 	app_connect(app, port)
 
 	rl.SetTraceLogLevel(.WARNING)
@@ -1161,7 +1196,6 @@ run_ui :: proc(app: ^App, port: string) {
 	if ok, path := run_cmd("fc-match", "-f", "%{file}", "sans-serif:style=Regular"); ok && path != "" {
 		ui.font_path = strings.clone(path)
 	}
-	prefs, has_prefs := prefs_load()
 	ui.fx_dock = prefs.fx_dock
 	ui_set_scale(&ui, has_prefs ? prefs.scale : default_scale())
 	presets_load(&ui.presets)
@@ -1172,6 +1206,10 @@ run_ui :: proc(app: ^App, port: string) {
 		frame_start := time.tick_now()
 		if user_active(&ui) do last_input = rl.GetTime()
 		app_poll(app)
+		if n := app.session.restored; n >= 0 {
+			app.session.restored = -1
+			set_status(ui = &ui, msg = fmt.tprintf("last session restored: %d writes", n))
+		}
 		cr_sync_pins(&ui)
 		handle_keys(&ui)
 		ui.wheel_used = false
