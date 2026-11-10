@@ -3,6 +3,8 @@ package oscmix_native
 import "base:runtime"
 import "core:fmt"
 import "core:strings"
+import "core:sync"
+import "core:thread"
 import "core:time"
 
 App :: struct {
@@ -22,6 +24,12 @@ App :: struct {
 	queue_pos:  int, // next to send
 	dev:        Device_Data, // local per-device data (names, groups, snapshots)
 	session:    Session, // last-session tracking and restore (session.odin)
+	// The window runs app_poll on a worker thread (app_worker_start): a hidden
+	// window blocks in EndDrawing for up to ~1 s per frame, which slowed the
+	// refresh dump and the restore to ~45 s. `lock` guards everything above.
+	lock:       sync.Mutex,
+	worker:     ^thread.Thread,
+	stop:       bool, // atomic
 }
 
 Queued_Write :: struct {
@@ -31,8 +39,9 @@ Queued_Write :: struct {
 
 // The interface silently drops writes sent in a burst (3760 at once: only
 // ~5% applied); 50 per 2 ms with MIDI serviced in between all landed
-// (tested). 100 per frame (~6000/s at 60 fps) stays well below that.
-QUEUE_PER_POLL :: 100
+// (tested). 12 per poll at one poll per 2 ms (~6000/s) stays well below that.
+QUEUE_PER_POLL :: 12
+POLL_INTERVAL :: 2 * time.Millisecond
 
 // The interface streams meter replies continuously while connected; this
 // long without any input means it is gone (unplugged, powered off, mode change).
@@ -127,6 +136,7 @@ app_shutdown :: proc(app: ^App) {
 
 // Sends one OSC message (float args) into the engine.
 app_send :: proc(app: ^App, addr: string, args: ..f32) {
+	app.ctx = context // engine callbacks run on the calling thread
 	if !app.connected do return
 	osc_encode(&app.osc_buf, addr, ..args)
 	engine_osc(raw_data(app.osc_buf), u32(len(app.osc_buf)))
@@ -158,8 +168,9 @@ app_queue_progress :: proc(app: ^App) -> (sent, total: int) {
 
 // Pumps MIDI input and the engine timer, and watches the connection: drops it
 // when the port vanishes or goes silent, and reconnects (with `reconnect`)
-// every WATCH_SECONDS while disconnected. Call often (every frame).
+// every WATCH_SECONDS while disconnected. Call every POLL_INTERVAL.
 app_poll :: proc(app: ^App, levels := true, reconnect := true) {
+	app.ctx = context // engine callbacks run on the calling thread
 	now := time.tick_now()
 	if !app.connected {
 		if reconnect && time.duration_seconds(time.tick_diff(app.last_check, now)) >= WATCH_SECONDS {
@@ -207,4 +218,33 @@ app_poll :: proc(app: ^App, levels := true, reconnect := true) {
 		app.last_save = now
 		state_save_mix(&app.st)
 	}
+}
+
+@(private = "file")
+app_worker :: proc(t: ^thread.Thread) {
+	app := (^App)(t.data)
+	for !sync.atomic_load(&app.stop) {
+		sync.mutex_lock(&app.lock)
+		app_poll(app)
+		sync.mutex_unlock(&app.lock)
+		free_all(context.temp_allocator)
+		time.sleep(POLL_INTERVAL)
+	}
+}
+
+// Polls the interface every POLL_INTERVAL on a worker thread until
+// app_worker_stop. Everything else must hold app.lock while it uses the App.
+app_worker_start :: proc(app: ^App) {
+	sync.atomic_store(&app.stop, false)
+	app.worker = thread.create(app_worker)
+	app.worker.data = app
+	thread.start(app.worker)
+}
+
+app_worker_stop :: proc(app: ^App) {
+	if app.worker == nil do return
+	sync.atomic_store(&app.stop, true)
+	thread.join(app.worker)
+	thread.destroy(app.worker)
+	app.worker = nil
 }

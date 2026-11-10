@@ -7,6 +7,7 @@ package oscmix_native
 
 import "core:fmt"
 import "core:math"
+import "core:sync"
 import "core:slice"
 import "core:strings"
 import "core:time"
@@ -1245,11 +1246,15 @@ run_ui :: proc(app: ^App, port: string) {
 	presets_load(&ui.presets)
 	settings_refresh(&ui)
 
+	// the interface is polled on its own thread from here on; the window holds
+	// app.lock while it reads or changes the App (everything up to EndDrawing)
+	app_worker_start(app)
+	defer app_worker_stop(app)
 	last_input: f64
 	for !rl.WindowShouldClose() {
 		frame_start := time.tick_now()
+		sync.mutex_lock(&app.lock)
 		if user_active(&ui) do last_input = rl.GetTime()
-		app_poll(app)
 		if n := app.session.restored; n >= 0 {
 			app.session.restored = -1
 			set_status(ui = &ui, msg = fmt.tprintf("last session restored: %d writes", n))
@@ -1290,6 +1295,7 @@ run_ui :: proc(app: ^App, port: string) {
 		draw_confirm(&ui, lw, lh)
 		draw_tip(&ui, lw, lh)
 		rl.EndMode2D()
+		sync.mutex_unlock(&app.lock) // EndDrawing can block for long while the window is hidden
 		rl.EndDrawing()
 		free_all(context.temp_allocator)
 		// pace by sleeping (raylib's limiter busy-waits part of every frame)
