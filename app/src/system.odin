@@ -114,8 +114,10 @@ run_cmd :: proc(argv: ..string) -> (ok: bool, output: string) {
 	return state.exited && state.exit_code == 0, text
 }
 
+// --no-block: jackd.service waits for the UFX III's device unit (BindsTo), so
+// with the unit switched off a blocking restart would hang the window ~90 s.
 jackd_restart :: proc() -> (ok: bool, output: string) {
-	return run_cmd("systemctl", "--user", "restart", "jackd.service")
+	return run_cmd("systemctl", "--user", "--no-block", "restart", "jackd.service")
 }
 
 audio_mode_script :: proc() -> string {return home_path(".local/bin/audio-mode")}
