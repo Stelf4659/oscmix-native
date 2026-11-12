@@ -76,3 +76,11 @@ SOFTWARE.
 ## raylib Odin bindings (`app/raylib/`)
 
 zlib/libpng license; see `app/raylib/LICENSE`.
+
+## Linked into the binary at build time (not in this repository)
+
+- raylib 6.0 (https://github.com/raysan5/raylib), zlib/libpng license; the
+  Makefile downloads the official release into `app/third_party/`.
+- WABT's wasm2c runtime (`wasm-rt-impl.c` and friends from
+  https://github.com/WebAssembly/wabt), Apache License 2.0; compiled from the
+  system's `/usr/share/wabt/wasm2c`.

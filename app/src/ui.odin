@@ -99,7 +99,6 @@ Widget :: enum u8 {
 
 Confirm_Action :: enum {
 	None,
-	Jack_Restart,
 	Interface_Mode,
 	Main_Out,
 	Save_Preset,
@@ -165,10 +164,6 @@ UI :: struct {
 	frame:         u64,
 	frame_dt:      f32, // seconds since the previous frame
 	last_frame:    f64,
-	jack_cfg:      Jack_Settings, // pending edit
-	jack_saved:    Jack_Settings, // as in jackd.env
-	jack_now:      Jack_Live,
-	audio_mode:    string, // owned
 	iface_pending: int,
 	main_pending:  int, // output to become Main Out (confirm dialog)
 	confirm:       Confirm_Action,
@@ -842,10 +837,7 @@ draw_topbar :: proc(ui: ^UI, w: f32) {
 		prefs_save(ui)
 	}
 
-	jack := ui.jack_saved
-	jtxt := jack.rate > 0 ? fmt.tprintf("JACK %d · %d×%d", jack.rate, jack.period, jack.nperiods) : "JACK: no jackd.env"
-	mode := ui.audio_mode != "" ? ui.audio_mode : "?"
-	info := fmt.tprintf("%s · %s · %d%%", jtxt, mode, int(ui.scale * 100 + 0.5))
+	info := fmt.tprintf("%d%%", int(ui.scale * 100 + 0.5))
 	iw := text_width(ui, info, FONT)
 	ix := bx - 16 - iw
 	text(ui, info, ix, 15, FONT, COL_DIM)
@@ -888,12 +880,6 @@ draw_topbar :: proc(ui: ^UI, w: f32) {
 }
 
 settings_refresh :: proc(ui: ^UI) {
-	if s, ok := jack_env_read(); ok {
-		ui.jack_saved, ui.jack_cfg = s, s
-	}
-	ui.jack_now = jack_live()
-	delete(ui.audio_mode)
-	ui.audio_mode = strings.clone(audio_mode_get())
 	ui.iface_pending = -1
 }
 
@@ -901,7 +887,7 @@ INTERFACE_MODES := [?]string{"Auto", "USB2", "USB3", "CC"}
 
 draw_settings :: proc(ui: ^UI, sw, sh: f32) {
 	app := ui.app
-	r := rl.Rectangle{(sw - 640) / 2, TOPBAR_H + 20, 640, 724}
+	r := rl.Rectangle{(sw - 640) / 2, TOPBAR_H + 20, 640, 460}
 	rl.DrawRectangleRec({0, 0, sw, sh}, {0, 0, 0, 120})
 	rl.DrawRectangleRounded(r, 0.03, 6, COL_STRIP)
 	x, y := r.x + 20, r.y + 18
@@ -934,67 +920,6 @@ draw_settings :: proc(ui: ^UI, sw, sh: f32) {
 		if button(ui, {x + 110 + f32(i) * 66, y, 60, 26}, fmt.tprintf("%d", f), ui.fps_unfocused == f) && ui.fps_unfocused != f {
 			ui.fps_unfocused = f
 			prefs_save(ui)
-		}
-	}
-
-	y += 50
-	text(ui, "JACK server (jackd)", x, y, FONT_HEAD)
-	live := ui.jack_now.running ? fmt.tprintf("running: %d Hz, %d frames", ui.jack_now.rate, ui.jack_now.period) : "not running"
-	text(ui, live, x + 220, y + 2, FONT, ui.jack_now.running ? COL_DIM : COL_RED)
-	y += 30
-	text(ui, "Sample rate", x, y + 5, FONT, COL_DIM)
-	for rate, i in JACK_RATES {
-		label := rate % 1000 == 0 ? fmt.tprintf("%dk", rate / 1000) : fmt.tprintf("%.1fk", f32(rate) / 1000)
-		if button(ui, {x + 110 + f32(i) * 76, y, 70, 26}, label, ui.jack_cfg.rate == rate) do ui.jack_cfg.rate = rate
-	}
-	y += 34
-	text(ui, "Buffer", x, y + 5, FONT, COL_DIM)
-	for p, i in JACK_PERIODS {
-		if button(ui, {x + 110 + f32(i) * 66, y, 60, 26}, fmt.tprintf("%d", p), ui.jack_cfg.period == p) do ui.jack_cfg.period = p
-	}
-	y += 34
-	text(ui, "Periods", x, y + 5, FONT, COL_DIM)
-	for n, i in JACK_NPERIODS {
-		if button(ui, {x + 110 + f32(i) * 66, y, 60, 26}, fmt.tprintf("%d", n), ui.jack_cfg.nperiods == n) do ui.jack_cfg.nperiods = n
-	}
-	cfg := ui.jack_cfg
-	if cfg.rate > 0 && cfg.period > 0 {
-		lat := f32(cfg.period * cfg.nperiods) / f32(cfg.rate) * 1000
-		text(ui, fmt.tprintf("output latency ~ %.2f ms", lat), x + 260, y + 5, FONT, COL_DIM)
-	}
-	y += 38
-	dirty := cfg != ui.jack_saved
-	only_period := dirty && cfg.rate == ui.jack_saved.rate && cfg.nperiods == ui.jack_saved.nperiods
-	if dirty {
-		if only_period {
-			if button(ui, {x, y, 210, 28}, "Apply buffer (live)") {
-				if jack_set_period_live(cfg.period) && jack_env_write(cfg) {
-					ui.jack_saved = cfg
-					set_status(ui, fmt.tprintf("JACK buffer now %d frames", cfg.period))
-				} else {
-					set_status(ui, "could not change the JACK buffer size")
-				}
-				ui.jack_now = jack_live()
-			}
-		} else if button(ui, {x, y, 210, 28}, "Apply & restart jackd") {
-			ui.confirm = .Jack_Restart
-		}
-		if button(ui, {x + 220, y, 90, 28}, "Revert") do ui.jack_cfg = ui.jack_saved
-	} else {
-		text(ui, "saved in ~/.config/jackd/jackd.env", x, y + 6, FONT_SMALL, COL_DIM)
-	}
-
-	y += 50
-	text(ui, "Audio mode", x, y, FONT_HEAD)
-	text(ui, "restart REAPER after switching", x + 220, y + 2, FONT, COL_DIM)
-	y += 30
-	for m, i in ([]string{"rme", "soundgrid"}) {
-		label := m == "rme" ? "RME (jackd)" : "SoundGrid"
-		if button(ui, {x + f32(i) * 160, y, 150, 28}, label, ui.audio_mode == m) && ui.audio_mode != m {
-			ok, out := audio_mode_set(m)
-			delete(ui.audio_mode)
-			ui.audio_mode = strings.clone(audio_mode_get())
-			set_status(ui, ok ? fmt.tprintf("audio mode: %s — restart REAPER", m) : fmt.tprintf("audio-mode failed: %s", out))
 		}
 	}
 
@@ -1035,8 +960,6 @@ draw_confirm :: proc(ui: ^UI, sw, sh: f32) {
 	case .Save_Preset, .Save_Snapshot, .Rename:
 		draw_text_dialog(ui, sw, sh)
 		return
-	case .Jack_Restart:
-		msg = fmt.tprintf("Restart jackd at %d Hz, %d×%d?\nAudio apps (REAPER) lose their JACK connection\nand must be restarted.", ui.jack_cfg.rate, ui.jack_cfg.period, ui.jack_cfg.nperiods)
 	case .Interface_Mode:
 		mode := INTERFACE_MODES[ui.iface_pending]
 		msg = mode == "CC" ? "Switch the interface to CC mode?\nThe unit restarts." : fmt.tprintf("Switch the interface to %s?\nThe unit restarts in driver mode: Linux has no driver for it,\nso audio and this app stop working. Switching back to CC\nneeds the front panel (SETUP > Options > Interface Mode).", mode)
@@ -1073,15 +996,6 @@ draw_confirm :: proc(ui: ^UI, sw, sh: f32) {
 			n := mixer_reset(ui.app, quiet[:], ui.reset_channels)
 			ui.snap_active = -1
 			set_status(ui, fmt.tprintf("mixer reset: %d writes", n))
-		case .Jack_Restart:
-			if !jack_env_write(ui.jack_cfg) {
-				set_status(ui, "could not write ~/.config/jackd/jackd.env")
-			} else {
-				ui.jack_saved = ui.jack_cfg
-				ok, out := jackd_restart()
-				set_status(ui, ok ? "jackd restarted" : fmt.tprintf("jackd restart failed: %s", out))
-			}
-			ui.jack_now = jack_live()
 		case .Interface_Mode:
 			app_send(ui.app, "/hardware/interfacemode", f32(ui.iface_pending))
 			set_status(ui, fmt.tprintf("interface mode: %s", INTERFACE_MODES[ui.iface_pending]))
@@ -1265,7 +1179,6 @@ run_ui :: proc(app: ^App, port: string) {
 	defer {
 		if ui.font_owned do rl.UnloadFont(ui.font)
 		delete(ui.font_path)
-		delete(ui.audio_mode)
 		delete(ui.status)
 		delete(ui.panels)
 		delete(ui.panel_scroll)
