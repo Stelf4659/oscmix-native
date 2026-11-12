@@ -158,6 +158,13 @@ UI :: struct {
 	reset_channels: bool, // reset dialog: also reset channel settings
 	// settings
 	show_settings: bool,
+	fps_focused:   int, // frame rate with focus (one of FPS_FOCUSED)
+	fps_unfocused: int, // without focus, hidden or minimized (one of FPS_UNFOCUSED)
+	// meters as drawn (meter_level)
+	meters:        map[u64]Meter_State,
+	frame:         u64,
+	frame_dt:      f32, // seconds since the previous frame
+	last_frame:    f64,
 	jack_cfg:      Jack_Settings, // pending edit
 	jack_saved:    Jack_Settings, // as in jackd.env
 	jack_now:      Jack_Live,
@@ -512,6 +519,32 @@ meter :: proc(r: rl.Rectangle, peak, rms: f32) {
 	if peak > -60 do rl.DrawRectangleRec({r.x, py, r.width, 2}, peak > -0.5 ? COL_RED : COL_TEXT)
 }
 
+Meter_State :: struct {
+	peak, rms: f32,
+	frame:     u64, // last frame it was advanced
+}
+
+// The interface updates levels ~20 times a second (ENGINE_TICK_SECONDS). Drawn
+// meters rise at once and glide down toward the latest value, so they move
+// every frame instead of in steps.
+METER_FALL_TAU :: 0.06 // seconds
+METER_FLOOR :: -61 // just below the meter's -60 dB bottom
+
+meter_level :: proc(ui: ^UI, row: Row, ch: int) -> (peak, rms: f32) {
+	pk, r := level_of(ui.app, row, ch)
+	pk, r = max(pk, METER_FLOOR), max(r, METER_FLOOR)
+	_, s, inserted, _ := map_entry(&ui.meters, u64(row) << 32 | u64(ch))
+	if inserted {
+		s^ = {pk, r, ui.frame}
+	} else if s.frame != ui.frame {
+		s.frame = ui.frame
+		k := 1 - math.exp(-ui.frame_dt / METER_FALL_TAU)
+		s.peak = pk >= s.peak ? pk : s.peak + (pk - s.peak) * k
+		s.rms = r >= s.rms ? r : s.rms + (r - s.rms) * k
+	}
+	return s.peak, s.rms
+}
+
 // --- mixer rows ------------------------------------------------------------
 
 channel_count :: proc(app: ^App, row: Row) -> int {
@@ -777,11 +810,11 @@ draw_strip :: proc(ui: ^UI, row: Row, ch: int, r: rl.Rectangle) {
 			app_send(app, faddr, new_db)
 			if known do group_fader_moved(app, row, ch, ui.submix, db, new_db)
 		}
-		pk, rms := level_of(app, row, ch)
+		pk, rms := meter_level(ui, row, ch)
 		mw: f32 = stereo ? 5 : 10
 		meter({r.x + r.width - 19, fr.y + 8, mw, fr.height - 16}, pk, rms)
 		if stereo {
-			pk, rms = level_of(app, row, ch + 1)
+			pk, rms = meter_level(ui, row, ch + 1)
 			meter({r.x + r.width - 13, fr.y + 8, mw, fr.height - 16}, pk, rms)
 		}
 	}
@@ -868,7 +901,7 @@ INTERFACE_MODES := [?]string{"Auto", "USB2", "USB3", "CC"}
 
 draw_settings :: proc(ui: ^UI, sw, sh: f32) {
 	app := ui.app
-	r := rl.Rectangle{(sw - 640) / 2, TOPBAR_H + 20, 640, 610}
+	r := rl.Rectangle{(sw - 640) / 2, TOPBAR_H + 20, 640, 724}
 	rl.DrawRectangleRec({0, 0, sw, sh}, {0, 0, 0, 120})
 	rl.DrawRectangleRounded(r, 0.03, 6, COL_STRIP)
 	x, y := r.x + 20, r.y + 18
@@ -883,6 +916,26 @@ draw_settings :: proc(ui: ^UI, sw, sh: f32) {
 		}
 	}
 	if button(ui, {x + 42 + f32(len(SCALE_PRESETS)) * 74, y, 34, 26}, "+") do ui_set_scale(ui, ui.scale + SCALE_STEP)
+
+	y += 50
+	text(ui, "Frame rate", x, y, FONT_HEAD)
+	text(ui, "meters and faders; vsync caps it at the monitor's rate", x + 220, y + 2, FONT, COL_DIM)
+	y += 30
+	text(ui, "Focused", x, y + 5, FONT, COL_DIM)
+	for f, i in FPS_FOCUSED {
+		if button(ui, {x + 110 + f32(i) * 66, y, 60, 26}, fmt.tprintf("%d", f), ui.fps_focused == f) && ui.fps_focused != f {
+			ui.fps_focused = f
+			prefs_save(ui)
+		}
+	}
+	y += 34
+	text(ui, "Unfocused", x, y + 5, FONT, COL_DIM)
+	for f, i in FPS_UNFOCUSED {
+		if button(ui, {x + 110 + f32(i) * 66, y, 60, 26}, fmt.tprintf("%d", f), ui.fps_unfocused == f) && ui.fps_unfocused != f {
+			ui.fps_unfocused = f
+			prefs_save(ui)
+		}
+	}
 
 	y += 50
 	text(ui, "JACK server (jackd)", x, y, FONT_HEAD)
@@ -1199,19 +1252,13 @@ handle_keys :: proc(ui: ^UI) {
 
 // --- main loop ---------------------------------------------------------------------
 
-// Frame rate: full while the user interacts or bulk writes are sent, half
-// otherwise (meters stay smooth at 30 fps).
-FPS_ACTIVE :: 60.0
-FPS_IDLE :: 30.0
-ACTIVE_SECONDS :: 0.5
-
-user_active :: proc(ui: ^UI) -> bool {
-	if d := rl.GetMouseDelta(); d.x != 0 || d.y != 0 do return true
-	if rl.GetMouseWheelMove() != 0 || rl.IsMouseButtonDown(.LEFT) || rl.IsMouseButtonDown(.RIGHT) do return true
-	if ui.active != 0 || ui.confirm != .None do return true
-	_, pending := app_queue_progress(ui.app)
-	return pending > 0
-}
+// Frame rate (Settings): the chosen rate while the window has focus, a low
+// one otherwise. The interface updates meters ~20 times/s (ENGINE_TICK_SECONDS);
+// MIDI and parameter writes run on the poll worker, independent of this.
+FPS_FOCUSED := []int{60, 90, 120, 144, 240}
+FPS_UNFOCUSED := []int{15, 30}
+FPS_FOCUSED_DEFAULT :: 60
+FPS_UNFOCUSED_DEFAULT :: 30
 
 run_ui :: proc(app: ^App, port: string) {
 	ui := UI{app = app, iface_pending = -1, snap_active = -1}
@@ -1224,6 +1271,7 @@ run_ui :: proc(app: ^App, port: string) {
 		delete(ui.panel_scroll)
 		delete(ui.pins)
 		delete(ui.pins_uid)
+		delete(ui.meters)
 		presets_destroy(&ui.presets)
 		strings.builder_destroy(&ui.text)
 	}
@@ -1242,6 +1290,8 @@ run_ui :: proc(app: ^App, port: string) {
 		ui.font_path = strings.clone(path)
 	}
 	ui.fx_dock = prefs.fx_dock
+	ui.fps_focused = slice.contains(FPS_FOCUSED, prefs.fps_focused) ? prefs.fps_focused : FPS_FOCUSED_DEFAULT
+	ui.fps_unfocused = slice.contains(FPS_UNFOCUSED, prefs.fps_unfocused) ? prefs.fps_unfocused : FPS_UNFOCUSED_DEFAULT
 	ui_set_scale(&ui, has_prefs ? prefs.scale : default_scale())
 	presets_load(&ui.presets)
 	settings_refresh(&ui)
@@ -1250,11 +1300,13 @@ run_ui :: proc(app: ^App, port: string) {
 	// app.lock while it reads or changes the App (everything up to EndDrawing)
 	app_worker_start(app)
 	defer app_worker_stop(app)
-	last_input: f64
 	for !rl.WindowShouldClose() {
 		frame_start := time.tick_now()
+		now := rl.GetTime()
+		ui.frame += 1
+		ui.frame_dt = f32(min(now - ui.last_frame, 0.25))
+		ui.last_frame = now
 		sync.mutex_lock(&app.lock)
-		if user_active(&ui) do last_input = rl.GetTime()
 		if n := app.session.restored; n >= 0 {
 			app.session.restored = -1
 			set_status(ui = &ui, msg = fmt.tprintf("last session restored: %d writes", n))
@@ -1299,7 +1351,8 @@ run_ui :: proc(app: ^App, port: string) {
 		rl.EndDrawing()
 		free_all(context.temp_allocator)
 		// pace by sleeping (raylib's limiter busy-waits part of every frame)
-		budget := 1.0 / (rl.GetTime() - last_input < ACTIVE_SECONDS ? FPS_ACTIVE : FPS_IDLE)
+		focused := rl.IsWindowFocused() && !rl.IsWindowHidden() && !rl.IsWindowMinimized()
+		budget := 1.0 / f64(focused ? ui.fps_focused : ui.fps_unfocused)
 		if el := time.duration_seconds(time.tick_since(frame_start)); el < budget {
 			time.sleep(time.Duration((budget - el) * f64(time.Second)))
 		}

@@ -12,6 +12,8 @@ Prefs :: struct {
 	scale:        f32,
 	fx_dock:      bool, // FX dock open
 	no_restore:   bool, // do not write the last session back on connect (session.odin)
+	fps_focused:  int, // frame rate while the window has focus (FPS_FOCUSED)
+	fps_unfocused: int, // frame rate otherwise (FPS_UNFOCUSED)
 	// device uid → outputs shown in the control room besides Main Out (the
 	// interface itself only stores the Main Out assignment)
 	control_room: map[string][]int,
@@ -40,6 +42,7 @@ prefs_save :: proc(ui: ^UI) {
 	if path == "" do return
 	p, _ := prefs_load()
 	p.scale, p.fx_dock, p.no_restore = ui.scale, ui.fx_dock, !ui.app.session.restore
+	p.fps_focused, p.fps_unfocused = ui.fps_focused, ui.fps_unfocused
 	if ui.pins_uid != "" {
 		if p.control_room == nil do p.control_room = make(map[string][]int, context.temp_allocator)
 		p.control_room[ui.pins_uid] = ui.pins[:]

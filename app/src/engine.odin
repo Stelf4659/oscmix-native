@@ -22,5 +22,8 @@ foreign libm {
 	@(link_name = "fabsf") _libm_fabsf :: proc(x: f32) -> f32 ---
 }
 
-// Engine timer period (OscMix Web uses the same 33 ms tick).
-ENGINE_TICK_SECONDS :: 0.033
+// Engine timer period. Each tick asks for meters, but on the UFX III the
+// engine sends at most ~40 requests/s and level values change every other
+// request: 33 ms (OscMix Web) gave 15 updates/s, 16 ms gives 20 and shorter
+// ticks no more (measured; no input overruns).
+ENGINE_TICK_SECONDS :: 0.016
