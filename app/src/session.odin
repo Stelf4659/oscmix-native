@@ -4,12 +4,14 @@ package oscmix_native
 //
 // The interface forgets its sends when switched off (tested), reports none of
 // its playback sends, and in its refresh dump lists exactly the input sends
-// that are on (PROGRESS.md, "Mixer readback"). So after the dump, input sends
+// that are on (docs/NOTES.md, "Mixer readback"). So after the dump, input sends
 // it did not list are off, and the app keeps the mixer as it last saw it (the
 // "last session", saved in the device file while the window runs) and writes
 // it back after every connect: reported settings only where they differ,
-// every send regardless. Sends the app never saw are written off, so after the
-// first restore every fader is known. Covers what a snapshot covers; preamp
+// every known send regardless. Sends the app never saw (playback sends before
+// they are first set here) are left alone rather than turned off, which would
+// silence the computer; without a saved session (first connect, unreadable
+// device file) nothing is written. Covers what a snapshot covers; preamp
 // gain, 48V, Hi-Z and reference level stay as the unit has them.
 
 import "core:fmt"
@@ -84,7 +86,8 @@ session_poll :: proc(app: ^App, now: time.Tick) {
 		}
 		s.phase, s.checked = .Done, now
 		if s.dump_done do inputs_from_dump(app)
-		if s.restore do s.restored = session_restore(app)
+		// nothing saved yet (or the device file is unreadable): capture only
+		if s.restore && app.dev.session.name != "" && app.dev.path != "" do s.restored = session_restore(app)
 	case .Done:
 		if len(app.queue) > 0 || time.duration_seconds(time.tick_diff(s.checked, now)) < SESSION_SAVE_SECONDS do return
 		s.checked = now
@@ -106,11 +109,13 @@ inputs_from_dump :: proc(app: ^App) {
 
 // Stores the current mixer as the last session if it changed. Not while a
 // restore or recall is still being sent: closing then must not save a half-written mix.
+// Sends the app never saw stay out of it (all_sends false), so restoring
+// leaves them as the unit has them instead of turning them off.
 session_save :: proc(app: ^App) {
 	if app.session.phase != .Done || len(app.queue) > 0 do return
-	values, _, _ := snapshot_capture(app, true)
+	values, _, all_sends := snapshot_capture(app, false)
 	cur := &app.dev.session
-	if cur.name != "" && cur.all_sends && len(cur.values) == len(values) {
+	if cur.name != "" && cur.all_sends == all_sends && len(cur.values) == len(values) {
 		same := true
 		for k, v in values {
 			if cv, ok := cur.values[k]; !ok || cv != v {
@@ -120,28 +125,26 @@ session_save :: proc(app: ^App) {
 		}
 		if same do return
 	}
-	snapshot_set(cur, SESSION_NAME, values, true)
+	snapshot_set(cur, SESSION_NAME, values, all_sends)
 	devdata_save(app)
 }
 
-// Queues the last session (or, with none saved, the current state, which
-// turns unknown sends off). Returns the number of writes queued.
+// Queues the saved last session. Returns the number of writes queued.
 session_restore :: proc(app: ^App) -> int {
 	app_queue_clear(app)
-	values := app.dev.session.values
-	if app.dev.session.name == "" do values, _, _ = snapshot_capture(app, true)
-	for addr, v in values {
+	s := &app.dev.session
+	for addr, v in s.values {
 		if !strings.has_prefix(addr, "/mix/") do queue_if_needed(app, addr, v)
 	}
 	for_each_send(app, proc(app: ^App, fader, pan: string, user: rawptr) {
-		values := (^map[string]f32)(user)
-		if v, listed := values[fader]; listed {
+		s := (^Snapshot)(user)
+		if v, listed := s.values[fader]; listed {
 			app_queue(app, fader, v)
-			if pv, ok := values[pan]; ok do app_queue(app, pan, pv)
-		} else {
+			if pv, ok := s.values[pan]; ok do app_queue(app, pan, pv)
+		} else if s.all_sends {
 			app_queue(app, fader, SEND_OFF_DB)
 		}
-	}, &values)
+	}, s)
 	return len(app.queue)
 }
 

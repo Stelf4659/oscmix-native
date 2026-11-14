@@ -98,7 +98,10 @@ state_load_mix :: proc(st: ^State) -> int {
 	data, err := os.read_entire_file(st.mix_path, context.temp_allocator)
 	if err != nil do return 0
 	saved: Mix_File
-	if json.unmarshal(data, &saved, allocator = context.temp_allocator) != nil do return 0
+	if json.unmarshal(data, &saved, allocator = context.temp_allocator) != nil {
+		set_aside_unreadable(st.mix_path)
+		return 0
+	}
 	n := 0
 	for addr, vals in saved {
 		if !strings.has_prefix(addr, "/mix/pb/") || state_has(st, addr) do continue

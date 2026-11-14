@@ -23,13 +23,15 @@ in a browser, and talks to the interface over ALSA MIDI (class-compliant mode).
   groups, local channel names.
 - The interface forgets its sends when powered off and never reports playback
   sends, so the app keeps the mix itself. It writes the last session back on
-  connect (can be turned off) and offers a mixer reset.
+  connect (can be turned off; the first connect only records it, and sends the
+  app has never seen are left alone) and offers a mixer reset.
 - Peak + RMS meters, DSP load, auto-reconnect, UI scaling, a frame-rate setting
   (separate rates for focused and unfocused windows).
 
 ## Requirements
 
-- Linux with ALSA (`libasound`), an interface in **CC mode** (front panel:
+- Linux on x86-64 (the build links raylib's prebuilt `linux_amd64` release)
+  with ALSA (`libasound`), an interface in **CC mode** (front panel:
   SETUP → Options → Interface Mode).
 - Build tools: [Odin](https://odin-lang.org/) (tested with dev-2026-10),
   [WABT](https://github.com/WebAssembly/wabt) 1.0.42 (`wasm2c` and its runtime
@@ -47,7 +49,7 @@ make            # builds ./oscmix-native; downloads checksum-pinned raylib 6.0 o
 make install    # ~/.local/bin/oscmix-native + a launcher entry "oscmix"
 ```
 
-`make install PREFIX=/usr/local` installs elsewhere. `make wasm WASM=path/to/oscmix.wasm`
+`make install PREFIX=/usr/local` installs elsewhere (`DESTDIR` is honoured for packaging). `make wasm WASM=path/to/oscmix.wasm`
 swaps in an engine from a newer OscMix Web release.
 
 ## Usage
@@ -57,8 +59,9 @@ oscmix-native [-p CLIENT:PORT]
 oscmix-native [-p CLIENT:PORT] --probe [SECONDS] [ADDR VALUE]...
 ```
 
-The app finds the RME control port on the ALSA sequencer by itself; `-p`
-picks one by hand (see `aconnect -l`). Only one window runs at a time.
+The app finds the RME control port on the ALSA sequencer by itself (the first
+one the engine supports); `-p` picks any port by hand (see `aconnect -l`).
+Only one window runs at a time.
 `--probe` connects without a window, optionally sends OSC values, and prints
 what the interface reported.
 

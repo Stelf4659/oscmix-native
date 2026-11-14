@@ -76,6 +76,7 @@ presets_load :: proc(f: ^Preset_File) {
 	if json.unmarshal(data, f) != nil {
 		presets_destroy(f)
 		f^ = {}
+		set_aside_unreadable(path)
 	}
 }
 

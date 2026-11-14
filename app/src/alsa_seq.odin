@@ -7,6 +7,7 @@ package oscmix_native
 
 import "core:c"
 import "core:fmt"
+import "core:strconv"
 import "core:strings"
 import "core:sync"
 import "core:sys/posix"
@@ -89,6 +90,7 @@ foreign asound {
 	snd_seq_port_info_get_name :: proc(info: ^Seq_Port_Info) -> cstring ---
 	snd_seq_port_info_get_capability :: proc(info: ^Seq_Port_Info) -> c.uint ---
 	snd_seq_query_next_port :: proc(seq: ^Seq, info: ^Seq_Port_Info) -> c.int ---
+	snd_seq_get_any_port_info :: proc(seq: ^Seq, client, port: c.int, info: ^Seq_Port_Info) -> c.int ---
 
 	snd_seq_set_client_pool_input :: proc(seq: ^Seq, size: c.size_t) -> c.int ---
 	snd_seq_poll_descriptors_count :: proc(seq: ^Seq, events: c.short) -> c.int ---
@@ -156,8 +158,28 @@ midi_find_rme_ports :: proc(seq: ^Seq, allocator := context.allocator) -> [dynam
 	return out
 }
 
-// Opens the sequencer and connects to `want` ("CLIENT:PORT"), or to the first RME control port.
-midi_open :: proc(m: ^Midi, want: string = "") -> (err: string) {
+// "CLIENT:PORT" of every RME control port, in sequencer order (temp-allocated).
+midi_rme_candidates :: proc() -> [dynamic]string {
+	out := make([dynamic]string, context.temp_allocator)
+	seq: ^Seq
+	if snd_seq_open(&seq, "default", SND_SEQ_OPEN_DUPLEX, SND_SEQ_NONBLOCK) < 0 do return out
+	defer snd_seq_close(seq)
+	for p in midi_find_rme_ports(seq, context.temp_allocator) do append(&out, fmt.tprintf("%d:%d", p.client, p.port))
+	return out
+}
+
+// Name of any sequencer port (temp-allocated); ok false if it does not exist.
+@(private = "file")
+port_name :: proc(seq: ^Seq, client, port: int) -> (name: string, ok: bool) {
+	pi: ^Seq_Port_Info
+	snd_seq_port_info_malloc(&pi)
+	defer snd_seq_port_info_free(pi)
+	if snd_seq_get_any_port_info(seq, c.int(client), c.int(port), pi) < 0 do return "", false
+	return strings.clone(string(snd_seq_port_info_get_name(pi)), context.temp_allocator), true
+}
+
+// Opens the sequencer and connects to `target` ("CLIENT:PORT", any port).
+midi_open :: proc(m: ^Midi, target: string) -> (err: string) {
 	if r := snd_seq_open(&m.seq, "default", SND_SEQ_OPEN_DUPLEX, SND_SEQ_NONBLOCK); r < 0 {
 		return fmt.aprintf("snd_seq_open: %s", snd_strerror(r))
 	}
@@ -172,23 +194,12 @@ midi_open :: proc(m: ^Midi, want: string = "") -> (err: string) {
 	)
 	if m.my_port < 0 do return fmt.aprintf("create port: %s", snd_strerror(m.my_port))
 
-	ports := midi_find_rme_ports(m.seq)
-	chosen := -1
-	defer {
-		// the chosen port's name moves into m.port_name
-		for p, i in ports do if i != chosen do delete(p.name)
-		delete(ports)
-	}
-	for p, i in ports {
-		if want == "" || fmt.tprintf("%d:%d", p.client, p.port) == want {
-			chosen = i
-			break
-		}
-	}
-	if chosen < 0 {
-		return want == "" ? strings.clone("no RME interface found on the ALSA sequencer (is it connected and in CC mode?)") : fmt.aprintf("MIDI port %s not found", want)
-	}
-	m.client, m.port, m.port_name = ports[chosen].client, ports[chosen].port, ports[chosen].name
+	cs, _, ps := strings.partition(target, ":")
+	client, cok := strconv.parse_int(cs, 10)
+	port, pok := strconv.parse_int(ps, 10)
+	name, found := port_name(m.seq, client, port)
+	if !cok || !pok || !found do return fmt.aprintf("MIDI port %s not found", target)
+	m.client, m.port, m.port_name = client, port, strings.clone(name)
 	if r := snd_seq_connect_from(m.seq, m.my_port, c.int(m.client), c.int(m.port)); r < 0 {
 		return fmt.aprintf("connect from %d:%d: %s", m.client, m.port, snd_strerror(r))
 	}
@@ -299,7 +310,6 @@ midi_port_present :: proc(m: ^Midi) -> bool {
 		m.watch = nil
 		return true // cannot tell; rely on the receive timeout
 	}
-	ports := midi_find_rme_ports(m.watch, context.temp_allocator)
-	for p in ports do if p.client == m.client && p.port == m.port && p.name == m.port_name do return true
-	return false
+	name, ok := port_name(m.watch, m.client, m.port)
+	return ok && name == m.port_name
 }

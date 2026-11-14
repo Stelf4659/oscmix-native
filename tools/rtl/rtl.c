@@ -276,9 +276,14 @@ main(int argc, char *argv[])
 	}
 	if (argc >= 4 && strcmp(argv[1], "jack") == 0)
 		return run_jack(argv[2], argv[3], argc > 4 ? atoi(argv[4]) : 5);
-	if (argc >= 8 && strcmp(argv[1], "alsa") == 0)
-		return run_alsa(argv[2], atoi(argv[3]), atoi(argv[4]), atoi(argv[5]),
-		                atoi(argv[6]), atoi(argv[7]), argc > 8 ? atoi(argv[8]) : 5);
+	if (argc >= 8 && strcmp(argv[1], "alsa") == 0) {
+		int ch = atoi(argv[3]), och = atoi(argv[4]), ich = atoi(argv[5]);
+		int period = atoi(argv[6]), nper = atoi(argv[7]);
+		if (ch > 0 && och >= 0 && och < ch && ich >= 0 && ich < ch && period > 0 && nper > 0)
+			return run_alsa(argv[2], ch, och, ich, period, nper, argc > 8 ? atoi(argv[8]) : 5);
+		fprintf(stderr, "rtl: need CHANNELS > 0, 0 <= OUTCH/INCH < CHANNELS, PERIOD and NPERIODS > 0\n");
+		return 2;
+	}
 	fprintf(stderr, "usage: rtl jack OUTPORT INPORT [secs]\n"
 	                "       rtl alsa DEVICE CHANNELS OUTCH INCH PERIOD NPERIODS [secs]\n");
 	return 2;

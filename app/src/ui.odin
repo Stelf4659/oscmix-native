@@ -991,7 +991,9 @@ draw_confirm :: proc(ui: ^UI, sw, sh: f32) {
 			quiet := make([dynamic]int, context.temp_allocator)
 			append(&quiet, ..cr_outputs(ui))
 			for ch in strip_channels(ui.app, .Output) {
-				if strings.has_prefix(interface_name(ui.app, .Output, ch), "PH") && !slice.contains(quiet[:], ch) do append(&quiet, ch)
+				// "PH 9" on the UFX III, "Phones 7" on the UCX
+				name := strings.to_upper(interface_name(ui.app, .Output, ch), context.temp_allocator)
+				if strings.has_prefix(name, "PH") && !slice.contains(quiet[:], ch) do append(&quiet, ch)
 			}
 			n := mixer_reset(ui.app, quiet[:], ui.reset_channels)
 			ui.snap_active = -1

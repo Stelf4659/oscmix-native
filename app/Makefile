@@ -54,13 +54,13 @@ wasm:
 
 PREFIX ?= $(HOME)/.local
 install: oscmix-native
-	install -Dm755 oscmix-native $(PREFIX)/bin/oscmix-native
-	mkdir -p $(PREFIX)/share/applications
+	install -Dm755 oscmix-native $(DESTDIR)$(PREFIX)/bin/oscmix-native
+	mkdir -p $(DESTDIR)$(PREFIX)/share/applications
 	printf '%s\n' '[Desktop Entry]' 'Type=Application' 'Name=oscmix' \
-		'Comment=RME TotalMix-style mixer (Fireface UFX III in CC mode)' \
+		'Comment=TotalMix-style mixer for RME interfaces in CC mode' \
 		'Exec=$(PREFIX)/bin/oscmix-native' 'Icon=audio-card' \
 		'Categories=AudioVideo;Audio;Mixer;' 'Terminal=false' \
-		> $(PREFIX)/share/applications/oscmix-native.desktop
+		> $(DESTDIR)$(PREFIX)/share/applications/oscmix-native.desktop
 
 clean:
 	rm -f engine/*.o engine/libengine.a oscmix-native

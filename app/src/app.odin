@@ -70,7 +70,8 @@ on_sysex :: proc(msg: []u8, user: rawptr) {
 	engine_sysex(raw_data(msg), u32(len(msg)))
 }
 
-// Connects to the interface (port "CLIENT:PORT" or auto-detect) and starts the engine.
+// Connects to the interface (port "CLIENT:PORT", or the first auto-detected
+// RME control port the engine supports) and starts the engine.
 app_connect :: proc(app: ^App, port: string = "") -> bool {
 	app.ctx = context
 	if port != app.port {
@@ -79,16 +80,38 @@ app_connect :: proc(app: ^App, port: string = "") -> bool {
 	}
 	delete(app.error)
 	app.error = ""
-	if err := midi_open(&app.midi, port); err != "" {
-		app.error = err
-		midi_close(&app.midi)
+	targets := port != "" ? []string{port} : midi_rme_candidates()[:]
+	if len(targets) == 0 {
+		app.error = strings.clone("no RME interface found on the ALSA sequencer (is it connected and in CC mode?)")
 		return false
 	}
-	name := strings.clone_to_cstring(app.midi.port_name, context.temp_allocator)
-	if engine_open(name, engine_midi_out, engine_osc_out, app) != 0 {
-		app.error = fmt.aprintf("the oscmix engine does not support \"%s\"", app.midi.port_name)
-		midi_close(&app.midi)
-		return false
+	opened := false
+	for target in targets {
+		delete(app.error)
+		app.error = ""
+		if err := midi_open(&app.midi, target); err != "" {
+			app.error = err
+			midi_close(&app.midi)
+			continue
+		}
+		name := strings.clone_to_cstring(app.midi.port_name, context.temp_allocator)
+		if engine_open(name, engine_midi_out, engine_osc_out, app) != 0 {
+			app.error = fmt.aprintf("the oscmix engine does not support \"%s\"", app.midi.port_name)
+			midi_close(&app.midi)
+			continue
+		}
+		opened = true
+		break
+	}
+	if !opened do return false
+	if app.device != "" && app.device != app.midi.port_name {
+		// Another interface (the port name carries the serial): drop the old
+		// one's mirror and local data, so neither its files nor its session
+		// get applied to this one; both reload once the new uid is reported.
+		state_destroy(&app.st)
+		app.st = {}
+		devdata_destroy(&app.dev)
+		app.dev = {}
 	}
 	delete(app.device)
 	app.device = strings.clone(app.midi.port_name)
