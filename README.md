@@ -8,6 +8,11 @@ in a browser, and talks to the interface over ALSA MIDI (class-compliant mode).
 > **Status:** used daily with a **Fireface UFX III in CC mode**; nothing else
 > has been tested. The engine knows more RME devices, so others may work,
 > but expect rough edges.
+>
+> Not yet exercised on hardware: switching between two interfaces in one run
+> (each should keep its own files and session), the first-connect session
+> behaviour of a fresh config (records only, writes nothing), and `-p` on a
+> non-RME-named port with a device the engine supports.
 
 ## Features
 
@@ -96,6 +101,8 @@ Settings and data live in `~/.config/oscmix-native/`:
 - [raylib](https://github.com/raysan5/raylib) (Ramon Santamaria) and the
   [Odin](https://github.com/odin-lang/Odin) raylib bindings.
 - [WABT](https://github.com/WebAssembly/wabt)'s `wasm2c`.
+- [Claude](https://www.anthropic.com/claude) (Anthropic): pre-release review
+  and fixes (first-connect restore, per-device state, port selection).
 
 Not affiliated with or endorsed by RME.
 
